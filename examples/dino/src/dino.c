@@ -56,10 +56,14 @@
  *   JUMP_FP = −9 px/tick launch → ~40 px apex, ~18 ticks (~0.6 s) air
  * =================================================================== */
 #define FP_SHIFT     3
-#define GRAVITY_FP   8               /* 1 px/tick²  */
-#define JUMP_FP     (-72)            /* −9 px/tick  */
-#define MAX_FALL_FP  80              /* 10 px/tick  */
+#define GRAVITY_FP   7               /* 0.875 px/tick²  */
+#define JUMP_FP     (-74)            /* −9.25 px/tick   */
+#define MAX_FALL_FP  80              /* 10 px/tick      */
 #define PHYS_MS      33u
+
+/* Jump feel: ~21 ticks of air (~0.7 s), apex ~49 px.  Lighter gravity rather
+ * than a harder launch, so the extra time is hang time near the top — which is
+ * where it helps clear a cactus — instead of a higher, faster arc. */
 
 /* Speed ramp: px/tick scroll speed by score */
 #define SPEED_BASE   3
