@@ -227,7 +227,7 @@ static uint8_t  g_level;
 static uint16_t g_sweep_t0;
 static uint16_t g_press_t0;
 static uint8_t  g_pressing;
-static uint8_t  g_drop_fired;
+static uint8_t  g_rotated;       /* this press has already rotated       */
 
 static uint16_t g_bat_raw = BAT_FULL;
 
@@ -417,8 +417,22 @@ static void hard_drop(void) {
     paint_board();
     draw_bar();
 
+    /* Topped out: the top four rows are the lane the next piece sweeps
+     * through, so anything left resting up there means there is nowhere for
+     * it to travel.  Checking only "does a piece fit at row 0" was not
+     * enough — with a full well, pieces kept fitting in the top rows and the
+     * game ran on forever after the player had plainly lost. */
+    for(uint8_t r = 0; r < 4; r++) {
+        for(uint8_t c = 0; c < COLS; c++) {
+            if(g_board[r][c]) {
+                game_over();
+                return;
+            }
+        }
+    }
+
     spawn();
-    if(!fits(g_shape[g_piece][g_rot], g_x, 0)) game_over();
+    paint_piece(1);
 }
 
 /* ===================================================================
@@ -476,8 +490,8 @@ static void draw_title(void) {
                           g_piece_col[i + 1u]);
     }
 
-    draw_text_mid("TAP ROTATE", 74, 2, COL_CHROME);
-    draw_text_mid("HOLD DROP", 90, 2, COL_CHROME);
+    draw_text_mid("TAP DROP", 74, 2, COL_CHROME);
+    draw_text_mid("HOLD ROTATE", 90, 2, COL_CHROME);
 
     if(g_best) {
         char buf[6];
@@ -553,28 +567,33 @@ void app_update(uint32_t frame) {
         break;
 
     case ST_PLAY: {
-        /* Press tracking: the drop fires the moment the hold threshold is
-         * crossed, and a release before that counts as a rotate.  Deciding
-         * on the threshold rather than on release means a drop happens when
-         * it looks like it should, not after the player lets go. */
+        /* Tap drops, hold rotates.
+         *
+         * The drop is the timing-critical action — it has to land while the
+         * piece is over the column you want — so it gets the gesture with the
+         * least latency.  A tap resolves on release, within about 60 ms of
+         * intent; a hold cannot resolve before its threshold, so putting the
+         * drop there made hitting a column almost impossible.
+         *
+         * Holding past the threshold rotates and re-arms, so keeping the
+         * button down cycles through the rotations. */
         if(btn && !g_pressing) {
-            g_pressing   = 1;
-            g_drop_fired = 0;
-            g_press_t0   = ms_now();
+            g_pressing = 1;
+            g_rotated  = 0;
+            g_press_t0 = ms_now();
         } else if(btn && g_pressing) {
             uint16_t held = (uint16_t)(ms_now() - g_press_t0);
-            if(!g_drop_fired) {
-                draw_charge(held);
-                if(held >= HOLD_MS) {
-                    g_drop_fired = 1;
-                    draw_charge(0);
-                    hard_drop();
-                }
+            draw_charge(held);
+            if(held >= HOLD_MS) {
+                rotate();
+                g_rotated  = 1;
+                g_press_t0 = ms_now();   /* re-arm: hold to keep rotating */
+                draw_charge(0);
             }
         } else if(!btn && g_pressing) {
             g_pressing = 0;
             draw_charge(0);
-            if(!g_drop_fired) rotate();
+            if(!g_rotated) hard_drop();
         }
 
         if(g_state != ST_PLAY) break;   /* hard_drop may have ended the game */
