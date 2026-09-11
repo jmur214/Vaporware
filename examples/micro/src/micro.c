@@ -34,6 +34,18 @@
 #define COL_TIMER   COL_RGB(255, 170,   0)  /* countdown bar             */
 #define COL_DIM     COL_RGB(190, 190, 190)  /* spent timer, empty slots  */
 #define COL_GOLD    COL_RGB(255, 200,   0)  /* best score                */
+#define COL_TBG     COL_RGB( 16,  16,  28)  /* title backdrop            */
+
+/* Title palette — the letters and border cycle through these.  Bright and
+ * clashing on purpose; this screen should look like a toy, not a utility. */
+static const uint16_t g_pal[6] = {
+    COL_RGB(255,  60,  60),
+    COL_RGB(255, 160,   0),
+    COL_RGB(255, 230,   0),
+    COL_RGB( 60, 220,  90),
+    COL_RGB(  0, 180, 255),
+    COL_RGB(160,  90, 255),
+};
 
 /* ===================================================================
  * Layout (128x160)
@@ -176,9 +188,10 @@ static const char* mg_prompt(uint8_t mg) {
  * Game state
  * =================================================================== */
 #define ST_TITLE   0
-#define ST_PLAY    1
-#define ST_RESULT  2
-#define ST_OVER    3
+#define ST_HOWTO   1
+#define ST_PLAY    2
+#define ST_RESULT  3
+#define ST_OVER    4
 
 #define NV_KEY_MICRO_BEST  NV_KEY_APP_1
 
@@ -207,6 +220,12 @@ static int16_t  g_mark_prev;     /* MG_STOP: last marker x (-1 = none)  */
 static uint8_t  g_mash_prev;     /* last mash count drawn               */
 
 static uint16_t g_bat_raw = BAT_FULL;
+
+/* Title animation */
+static uint16_t g_hue_t0;
+static uint8_t  g_hue;
+static uint16_t g_blink_t0;
+static uint8_t  g_blink_on;
 
 /* ===================================================================
  * Status bar — score on the left, remaining lives on the right
@@ -324,11 +343,88 @@ static void game_begin(void) {
 /* ===================================================================
  * Screens
  * =================================================================== */
+/* ── Title ────────────────────────────────────────────────────────────
+ * Animated, but only the parts that actually change are repainted: the ten
+ * title letters, the border, and the blinking prompt.  Everything is drawn
+ * over itself in a new colour rather than cleared first — the set pixels are
+ * in the same places each pass, so there is nothing to erase.            */
+
+#define TITLE_X      16     /* 5 chars at scale 5 = 95 px wide, centred   */
+#define TITLE_Y1     34
+#define TITLE_Y2     70
+#define TITLE_STEP   20     /* CELL_W(5)                                  */
+#define PROMPT_BLINK 480u
+#define HUE_STEP     140u
+
+static void title_letters(uint8_t off) {
+    static const char top[] = "MICRO";
+    static const char bot[] = "GAMES";
+
+    for(uint8_t i = 0; i < 5; i++) {
+        uint16_t x = (uint16_t)(TITLE_X + i * TITLE_STEP);
+
+        const uint8_t* bm = glyph_for(top[i]);
+        if(bm) draw_glyph(bm, x, TITLE_Y1, 5, g_pal[(i + off) % 6u]);
+
+        bm = glyph_for(bot[i]);
+        if(bm) draw_glyph(bm, x, TITLE_Y2, 5, g_pal[(i + off + 3u) % 6u]);
+    }
+}
+
+static void title_border(uint8_t off) {
+    uint16_t c = g_pal[off % 6u];
+    display_fill_rect(0, 0, LCD_WIDTH, 4, c);
+    display_fill_rect(0, (uint16_t)(LCD_HEIGHT - 4), LCD_WIDTH, 4, c);
+    display_fill_rect(0, 0, 4, LCD_HEIGHT, c);
+    display_fill_rect((uint16_t)(LCD_WIDTH - 4), 0, 4, LCD_HEIGHT, c);
+}
+
+static void title_prompt(uint8_t on) {
+    display_fill_rect(6, 122, (uint16_t)(LCD_WIDTH - 12), 16, COL_TBG);
+    if(on) draw_text_mid("TAP", 122, 3, COL_INK);
+}
+
 static void draw_title(void) {
+    display_fill(COL_TBG);
+    title_border(0);
+    title_letters(0);
+    title_prompt(1);
+
+    if(g_best) {
+        char buf[4];
+        uint32_t b = (g_best > 999u) ? 999u : g_best;
+        buf[0] = (char)('0' + (b / 100u) % 10u);
+        buf[1] = (char)('0' + (b / 10u) % 10u);
+        buf[2] = (char)('0' + b % 10u);
+        buf[3] = '\0';
+        draw_text_mid(buf, 144, 2, COL_GOLD);
+    }
+}
+
+/* ── How to play ──────────────────────────────────────────────────────
+ * Six rows: the prompt as it appears in-game on the left, what it actually
+ * wants on the right.  Static, drawn once.                               */
+static void draw_howto(void) {
     display_fill(COL_BG);
-    draw_text_mid("MICRO", 34, 5, COL_INK);
-    draw_text_mid("GAMES", 70, 5, COL_INK);
-    draw_text_mid("PRESS", 118, 3, COL_LOSE);
+
+    draw_text_mid("HOW TO", 8, 3, COL_INK);
+
+    static const char* const name[6] = {
+        "TAP", "NO TAP", "MASH", "HOLD", "WAIT", "STOP"
+    };
+    static const char* const want[6] = {
+        "PRESS", "DONT", "MASH X6", "HOLD IT", "AFTER GO", "ON GREEN"
+    };
+
+    for(uint8_t i = 0; i < 6; i++) {
+        uint16_t y = (uint16_t)(34 + i * 16);
+        draw_text(name[i], 6, y, 2, g_pal[i]);
+        draw_text(want[i], 58, y, 2, COL_INK);
+    }
+
+    /* The one rule that is not obvious from playing. */
+    draw_text_mid("PROMPTS LIE", 134, 2, COL_LOSE);
+    draw_text_mid("TAP TO START", 150, 2, COL_DIM);
 }
 
 static void draw_over(void) {
@@ -357,6 +453,16 @@ static void draw_result(uint8_t passed) {
                       passed ? COL_WIN : COL_LOSE);
     draw_text_mid(passed ? "OK" : "MISS", 60, 5, COL_WHITE);
     draw_score_bar();
+}
+
+/* Enter the title screen and reset its animation clocks. */
+static void enter_title(void) {
+    g_state    = ST_TITLE;
+    g_hue      = 0;
+    g_blink_on = 1;
+    draw_title();
+    g_hue_t0   = ms_now();
+    g_blink_t0 = g_hue_t0;
 }
 
 /* ===================================================================
@@ -440,6 +546,28 @@ void app_update(uint32_t frame) {
 
     /* -------------------------------------------------------------- */
     case ST_TITLE:
+        if(edge) {
+            g_state = ST_HOWTO;
+            draw_howto();
+            break;
+        }
+        /* Cycle the letter/border hues and blink the prompt on their own
+         * schedules, so the screen never sits still. */
+        if((uint16_t)(ms_now() - g_hue_t0) >= HUE_STEP) {
+            g_hue_t0 = ms_now();
+            g_hue++;
+            title_letters(g_hue);
+            title_border(g_hue);
+        }
+        if((uint16_t)(ms_now() - g_blink_t0) >= PROMPT_BLINK) {
+            g_blink_t0 = ms_now();
+            g_blink_on = !g_blink_on;
+            title_prompt(g_blink_on);
+        }
+        break;
+
+    /* -------------------------------------------------------------- */
+    case ST_HOWTO:
         if(edge) game_begin();
         break;
 
@@ -560,8 +688,7 @@ void app_wake(void) {
     default:
         /* Do not resume a round that was interrupted by sleep — the timer
          * reference is long gone and the player never saw it. */
-        g_state = ST_TITLE;
-        draw_title();
+        enter_title();
         break;
     }
 }
