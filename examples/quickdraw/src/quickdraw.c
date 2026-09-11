@@ -51,12 +51,24 @@
 /* ===================================================================
  * Layout (128x160)
  * =================================================================== */
-#define GROUND_Y   104
-#define BAND_Y      58      /* sits entirely in sky, clear of sun and    */
-#define BAND_H      44      /* ground, so clearing it is one flat fill   */
+#define GROUND_Y    96
+#define BAND_Y      52      /* sits entirely in sky, clear of sun and    */
+#define BAND_H      42      /* ground, so clearing it is one flat fill   */
 #define SUN_CX      64
-#define SUN_CY      36
-#define SUN_R       17
+#define SUN_CY      30
+#define SUN_R       15
+
+/* The two duellists face each other across the sand, below everything the
+ * signal touches, so firing never disturbs the band or the timing path. */
+#define GUN_W       37
+#define GUN_H       25
+#define GUN_Y      120
+#define GUN_L_X      6      /* the ghost, pointing right                 */
+#define GUN_R_X     86      /* the player, pointing left                 */
+
+#define COL_FLASH_A COL_RGB(255, 255, 240)
+#define COL_FLASH_B COL_RGB(255, 240, 120)
+#define COL_FLASH_C COL_RGB(255, 160,  40)
 
 /* ===================================================================
  * Tuning
@@ -183,6 +195,53 @@ static void draw_cactus(uint16_t x, uint16_t base, uint16_t h) {
     display_fill_rect((uint16_t)(x + 10), (uint16_t)(base - h + 16), 6, 3, COL_CACTUS);
 }
 
+/* Revolver silhouette, GUN_W x GUN_H, built from rectangles because that is
+ * all the SDK draws.  At this size the shape reads almost entirely from the
+ * proportions of barrel, cylinder and grip, so those get the pixels and the
+ * detail is left out.  The muzzle is at dx 0, so the default points LEFT and
+ * flip turns it around. */
+static void draw_revolver(uint16_t x, uint16_t y, uint8_t flip, uint16_t col) {
+    static const uint8_t part[9][4] = {
+        {  0,  6, 22,  5 },   /* barrel        */
+        {  2,  4,  3,  2 },   /* front sight   */
+        { 22,  3,  9, 11 },   /* cylinder      */
+        { 31,  5,  5,  9 },   /* frame         */
+        { 32,  1,  4,  4 },   /* hammer        */
+        { 26, 14,  9,  2 },   /* trigger guard */
+        { 30, 14,  6,  4 },   /* grip upper    */
+        { 31, 18,  6,  4 },   /* grip mid      */
+        { 32, 22,  5,  3 },   /* grip butt     */
+    };
+
+    for(uint8_t i = 0; i < 9; i++) {
+        uint8_t dx = part[i][0], dy = part[i][1];
+        uint8_t w  = part[i][2], h  = part[i][3];
+        uint16_t px = flip ? (uint16_t)(x + (GUN_W - dx - w)) : (uint16_t)(x + dx);
+        display_fill_rect(px, (uint16_t)(y + dy), w, h, col);
+    }
+}
+
+/* Three tapering blocks off the muzzle, brightest where the barrel ends. */
+static void muzzle_flash(uint16_t x, uint16_t y, uint8_t flip) {
+    uint16_t my = (uint16_t)(y + 2);
+
+    if(flip) {
+        uint16_t m = (uint16_t)(x + GUN_W);
+        display_fill_rect(m,                    my,      6, 13, COL_FLASH_A);
+        display_fill_rect((uint16_t)(m + 6),    (uint16_t)(my + 2), 5,  9, COL_FLASH_B);
+        display_fill_rect((uint16_t)(m + 11),   (uint16_t)(my + 4), 4,  5, COL_FLASH_C);
+    } else {
+        display_fill_rect((uint16_t)(x - 6),    my,      6, 13, COL_FLASH_A);
+        display_fill_rect((uint16_t)(x - 11),   (uint16_t)(my + 2), 5,  9, COL_FLASH_B);
+        display_fill_rect((uint16_t)(x - 15),   (uint16_t)(my + 4), 4,  5, COL_FLASH_C);
+    }
+}
+
+static void draw_guns(void) {
+    draw_revolver(GUN_L_X, GUN_Y, 1, COL_DARK);
+    draw_revolver(GUN_R_X, GUN_Y, 0, COL_DARK);
+}
+
 /* Round outcomes: 0 pending, 1 won, 2 lost */
 static uint8_t g_res[ROUNDS];
 
@@ -202,8 +261,9 @@ static void draw_scene(void) {
 
     display_fill_rect(0, GROUND_Y, LCD_WIDTH,
                       (uint16_t)(LCD_HEIGHT - GROUND_Y), COL_SAND);
-    draw_cactus(8, (uint16_t)(GROUND_Y + 30), 34);
-    draw_cactus(102, (uint16_t)(GROUND_Y + 24), 26);
+    draw_cactus(2, 114, 16);
+    draw_cactus(108, 112, 14);
+    draw_guns();
 
     draw_pips();
 }
@@ -246,35 +306,48 @@ static void draw_title(void) {
 
     display_fill_rect(0, GROUND_Y, LCD_WIDTH,
                       (uint16_t)(LCD_HEIGHT - GROUND_Y), COL_SAND);
-    draw_cactus(8, (uint16_t)(GROUND_Y + 30), 34);
-    draw_cactus(102, (uint16_t)(GROUND_Y + 24), 26);
+    draw_cactus(2, 114, 16);
+    draw_cactus(108, 112, 14);
 
-    draw_text_mid("QUICK", 22, 4, COL_DARK);
-    draw_text_mid("DRAW", 50, 4, COL_DARK);
+    draw_text_mid("QUICK", 14, 4, COL_DARK);
+    draw_text_mid("DRAW", 40, 4, COL_DARK);
 
     char buf[4];
     ms_str(buf, g_ghost);
-    draw_text_mid("BEAT", 84, 2, COL_DARK);
-    draw_text(buf, 46, 98, 3, COL_GOLD);
-    draw_text("MS", 84, 100, 2, COL_DARK);
+    draw_text_mid("BEAT", 68, 2, COL_DARK);
+    draw_text(buf, 44, 80, 3, COL_GOLD);
+    draw_text("MS", 82, 82, 2, COL_DARK);
 
-    draw_text_mid("TAP", 132, 3, COL_DARK);
+    /* One revolver on the title, mid-shot, so the game announces itself. */
+    draw_revolver(46, GUN_Y, 0, COL_DARK);
+    muzzle_flash(46, GUN_Y, 0);
+
+    draw_text_mid("TAP", 148, 2, COL_DARK);
 }
 
 static void draw_round_result(uint16_t rt, uint8_t fail, const char* why) {
     draw_scene();
 
     if(fail) {
+        /* Fumbling the draw is still a loss, so the ghost is the one who
+         * gets a shot off. */
         band(COL_LOSE, 0);
-        draw_text_mid(why, (uint16_t)(BAND_Y + 14), 3, COL_TEXT);
+        draw_text_mid(why, (uint16_t)(BAND_Y + 12), 3, COL_TEXT);
+        muzzle_flash(GUN_L_X, GUN_Y, 1);
     } else {
         char buf[4];
         ms_str(buf, rt);
         uint8_t won = (rt < g_ghost);
+
         band(won ? COL_WIN : COL_DARK, 0);
-        draw_text(buf, 28, (uint16_t)(BAND_Y + 8), 5, COL_TEXT);
-        draw_text("MS", 92, (uint16_t)(BAND_Y + 18), 3, COL_TEXT);
-        draw_text_mid(won ? "FASTER" : "TOO SLOW", 120, 2, COL_DARK);
+        draw_text(buf, 28, (uint16_t)(BAND_Y + 6), 5, COL_TEXT);
+        draw_text("MS", 92, (uint16_t)(BAND_Y + 16), 3, COL_TEXT);
+
+        /* Whoever was faster is the one who fires. */
+        if(won) muzzle_flash(GUN_R_X, GUN_Y, 0);
+        else    muzzle_flash(GUN_L_X, GUN_Y, 1);
+
+        draw_text_mid(won ? "FASTER" : "TOO SLOW", 102, 2, COL_DARK);
     }
 }
 
@@ -323,7 +396,7 @@ static const char* decoy_word(void) {
 
 static void run_round(void) {
     draw_scene();
-    draw_text_mid("STEADY", 118, 2, COL_DARK);
+    draw_text_mid("STEADY", 102, 2, COL_DARK);
 
     /* Demand a clean release first: holding the button into a round would
      * otherwise register instantly as jumping the gun. */
