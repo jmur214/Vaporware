@@ -52,6 +52,10 @@ static const char* const g_tier_name[3] = { "MILD", "SPICY", "UNHINGED" };
 #define WRAP_CHARS  15      /* 15 * 8 - 2 = 118 px, inside a 128 px panel */
 
 #define HOLD_MS    550u     /* hold on the tier screen to lock it in      */
+#define DOUBLE_MS  320u     /* window for the second tap of a skip        */
+#define PENALTY_MS 1100u    /* how long the penalty card stays up         */
+
+#define COL_SKIP    COL_RGB(255, 180,  40)
 
 #define NV_KEY_TIER  NV_KEY_APP_0
 
@@ -183,6 +187,7 @@ static uint32_t rnd(uint32_t mod) {
 #define ST_READY  2
 #define ST_SPIN   3
 #define ST_CARD   4
+#define ST_PEN    5
 
 static uint8_t  g_state;
 static uint8_t  g_tier;
@@ -200,7 +205,20 @@ static uint8_t  g_pressing;
 static uint16_t g_press_t0;
 static uint8_t  g_held_fired;
 
+/* Skip bookkeeping.  A single tap has to wait out the double-tap window
+ * before it counts as "done", which costs about a third of a second on the
+ * common action — unnoticeable while the device is handed round a circle,
+ * and the price of having a second gesture at all. */
+static uint8_t  g_tap_pending;
+static uint16_t g_tap_t0;
+static uint8_t  g_skip_cost;
+static uint16_t g_penalty;
+
 static uint16_t g_bat_raw = BAT_FULL;
+
+static const char* current_card(void) {
+    return g_is_dare ? g_dare[g_tier][g_idx] : g_truth[g_tier][g_idx];
+}
 
 /* ===================================================================
  * Chrome
@@ -247,6 +265,19 @@ static void draw_ready(void) {
     draw_tier_tag();
     draw_text_mid("TAP TO", 56, 3, COL_DIM);
     draw_text_mid("SPIN", 84, 4, COL_INK);
+
+    /* Running shame meter for the whole circle — the device cannot tell who
+     * is holding it, and a shared total is funnier than none at all. */
+    if(g_penalty) {
+        char buf[4];
+        uint16_t v = (g_penalty > 999u) ? 999u : g_penalty;
+        buf[0] = (char)('0' + (v / 100u) % 10u);
+        buf[1] = (char)('0' + (v / 10u) % 10u);
+        buf[2] = (char)('0' + v % 10u);
+        buf[3] = '\0';
+        draw_text_mid("CHICKEN", 128, 1, COL_DIM);
+        draw_text_mid(buf, 138, 2, COL_SKIP);
+    }
 }
 
 /* One frame of the spin: the two faces alternate, slowing down. */
@@ -263,10 +294,28 @@ static void draw_card(void) {
     draw_text_mid(g_is_dare ? "DARE" : "TRUTH", HEAD_Y, 4, col);
     display_fill_rect(14, RULE_Y, (uint16_t)(LCD_WIDTH - 28), 2, col);
 
-    const char* card = g_is_dare ? g_dare[g_tier][g_idx] : g_truth[g_tier][g_idx];
-    draw_wrapped(card, CARD_Y, COL_INK);
+    draw_wrapped(card_text(current_card()), CARD_Y, COL_INK);
 
-    draw_text_mid("TAP NEXT", 150, 1, COL_DIM);
+    draw_text_mid("TAP DONE", 142, 1, COL_DIM);
+    draw_text_mid("TAP TWICE TO SKIP", 152, 1, COL_SKIP);
+}
+
+/* The skip screen states the price and nothing else.  The point is that the
+ * cost is public — the table sees what you were willing to pay. */
+static void draw_penalty(void) {
+    display_fill(COL_BG);
+    draw_tier_tag();
+
+    draw_text_mid("SKIPPED", 40, 3, COL_DIM);
+
+    char d[2];
+    d[0] = (char)('0' + g_skip_cost);
+    d[1] = '\0';
+    draw_text_mid(d, 70, 6, COL_SKIP);
+
+    draw_text_mid(g_skip_cost == 1u ? "FAIR ENOUGH"
+                : g_skip_cost == 2u ? "THAT COST YOU"
+                                    : "COWARD", 128, 1, COL_DIM);
 }
 
 /* ===================================================================
@@ -361,6 +410,7 @@ void app_update(uint32_t frame) {
             g_held_fired = 1;
             nv_write(NV_KEY_TIER, g_tier);
             g_seed ^= ((uint32_t)ms_now() << 9) ^ 0x9E3779B9UL;
+            g_penalty = 0;      /* new tier, fresh round of shame */
             g_state = ST_READY;
             draw_ready();
         } else if(rel) {
@@ -394,7 +444,30 @@ void app_update(uint32_t frame) {
     }
 
     case ST_CARD:
+        /* First tap opens a window; a second inside it is a skip, and the
+         * window closing on its own means the card was taken. */
         if(edge) {
+            if(g_tap_pending) {
+                g_tap_pending = 0;
+                g_skip_cost   = card_cost(current_card());
+                g_penalty     = (uint16_t)(g_penalty + g_skip_cost);
+                draw_penalty();
+                g_tap_t0 = ms_now();
+                g_state  = ST_PEN;
+            } else {
+                g_tap_pending = 1;
+                g_tap_t0      = ms_now();
+            }
+        } else if(g_tap_pending &&
+                  (uint16_t)(ms_now() - g_tap_t0) >= DOUBLE_MS) {
+            g_tap_pending = 0;
+            g_state = ST_READY;
+            draw_ready();
+        }
+        break;
+
+    case ST_PEN:
+        if((uint16_t)(ms_now() - g_tap_t0) >= PENALTY_MS) {
             g_state = ST_READY;
             draw_ready();
         }
@@ -409,7 +482,8 @@ void app_update(uint32_t frame) {
 void app_wake(void) {
     /* Come back to the spin prompt rather than a stale card — whoever woke it
      * is a new turn. */
-    g_pressing = 0;
-    g_state    = ST_READY;
+    g_pressing    = 0;
+    g_tap_pending = 0;
+    g_state       = ST_READY;
     draw_ready();
 }
