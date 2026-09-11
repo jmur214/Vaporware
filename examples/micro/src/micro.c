@@ -2,17 +2,32 @@
  *           (N32G031K8Q7-1 + GC9107 128x160 LCD, Vaporware SDK)
  *
  * Three-second microgames, one after another, getting faster.  Four lives.
- * Six game types, and from round 6 onward the prompt may LIE: it shows the
- * wrong instruction first and swaps to the real one partway through, so
- * committing early gets you killed.
+ * Six game types, and a REVERSE rule that inverts what the prompt means.
  *
- * Controls: PA7 button is the only input — tap, mash, or hold depending on
- * what the screen is (currently) telling you.
+ * ── Why reverse, and not a lying prompt ─────────────────────────────────
+ * The first version hid the trick: the prompt silently swapped halfway
+ * through the round.  That is not difficulty, it is a coin toss — commit
+ * early and die, hesitate and live, with no way to read which round you are
+ * in.  Nothing about it rewards skill or improves with practice.
+ *
+ * REVERSE puts every piece of information on screen from the first frame:
+ * a purple play area means do the OPPOSITE of the prompt.  Nothing is hidden,
+ * so a loss is always a misread rather than bad luck — but you still have to
+ * perform the inversion in about a second, which is a real cognitive load
+ * (the same shape as a go/no-go reversal task) and one that measurably
+ * speeds up with practice.
+ *
+ * From round 14 a round can SWITCH mid-way: the whole play area re-themes in
+ * front of you.  That keeps the chaos of the original idea while staying
+ * fair — the change is visible, so reacting to it is a reflex test rather
+ * than a guess.
+ *
+ * Controls: PA7 button is the only input.
  *
  * Rendering follows the house pattern from flappy.c / dino.c: the static part
  * of a round is drawn once at round start, and each frame touches only what
- * actually moved (timer bar, sweep marker, mash counter).  A full-screen
- * display_fill() costs ~50 ms, which would eat most of a 1.2 s round.
+ * actually moved.  A full display_fill() costs ~50 ms, which would eat most
+ * of a 1.2 s round.
  *
  * High score: NV_KEY_APP_1 (dino owns NV_KEY_APP_0, flappy NV_KEY_HIGH_SCORE).
  */
@@ -24,20 +39,22 @@
 /* ===================================================================
  * Palette
  * =================================================================== */
-#define COL_BG      COL_RGB(245, 245, 245)  /* page white                */
-#define COL_INK     COL_RGB( 30,  30,  30)  /* prompt text               */
+#define COL_BG      COL_RGB(245, 245, 245)  /* normal play area          */
+#define COL_INK     COL_RGB( 30,  30,  30)  /* normal prompt text        */
+#define COL_REV     COL_RGB( 78,  24, 120)  /* REVERSE play area         */
+#define COL_REVINK  COL_RGB(255, 255, 255)  /* REVERSE prompt text       */
 #define COL_BAR     COL_BLACK               /* status bar                */
 #define COL_CHROME  COL_WHITE               /* status bar text           */
 #define COL_WIN     COL_RGB( 40, 190,  70)  /* pass flash, safe zone     */
-#define COL_LOSE    COL_RGB(230,  40,  40)  /* fail flash, lost lives    */
-#define COL_GO      COL_RGB( 40, 190,  70)  /* the "GO!" signal          */
+#define COL_LOSE    COL_RGB(230,  40,  40)  /* fail flash, lives         */
+#define COL_GO      COL_RGB( 40, 190,  70)  /* the GO signal             */
 #define COL_TIMER   COL_RGB(255, 170,   0)  /* countdown bar             */
-#define COL_DIM     COL_RGB(190, 190, 190)  /* spent timer, empty slots  */
+#define COL_DIM     COL_RGB(150, 150, 155)  /* spent timer, empty slots  */
 #define COL_GOLD    COL_RGB(255, 200,   0)  /* best score                */
 #define COL_TBG     COL_RGB( 16,  16,  28)  /* title backdrop            */
 
-/* Title palette — the letters and border cycle through these.  Bright and
- * clashing on purpose; this screen should look like a toy, not a utility. */
+/* Title palette — letters and border cycle through these.  Bright and
+ * clashing on purpose; this screen should look like a toy. */
 static const uint16_t g_pal[6] = {
     COL_RGB(255,  60,  60),
     COL_RGB(255, 160,   0),
@@ -50,10 +67,10 @@ static const uint16_t g_pal[6] = {
 /* ===================================================================
  * Layout (128x160)
  * =================================================================== */
-#define BAR_H        14                 /* status bar height            */
-#define PROMPT_Y     42                 /* prompt text top              */
-#define PROMPT_H     24                 /* prompt cell height (scale 4) */
-#define STAGE_Y      82                 /* per-game visuals top         */
+#define BAR_H        14
+#define PROMPT_Y     42
+#define PROMPT_H     24
+#define STAGE_Y      82
 #define STAGE_H      44
 #define TIMER_Y     140
 #define TIMER_H      12
@@ -63,31 +80,28 @@ static const uint16_t g_pal[6] = {
 /* ===================================================================
  * Tuning
  * =================================================================== */
-#define ROUND_START_MS  3000u   /* first round length                   */
-#define ROUND_STEP_MS    120u   /* shaved per round                     */
-#define ROUND_MIN_MS    1200u   /* floor — below this it is unreadable  */
-#define RESULT_MS        550u   /* pass/fail flash                      */
+#define ROUND_START_MS  3000u
+#define ROUND_STEP_MS    120u
+#define ROUND_MIN_MS    1200u
+#define RESULT_MS        550u
 #define LIVES_START        4u
-#define LIE_FROM_ROUND     6u   /* prompts start lying here             */
+#define REV_FROM_ROUND     4u   /* reverse rounds start appearing here   */
+#define SWITCH_FROM_ROUND 14u   /* mid-round re-theme starts here        */
 #define MASH_TARGET        6u
 
 /* ===================================================================
  * 3x5 glyphs, drawn at an arbitrary integer scale
  * =================================================================== */
 static const uint8_t g_alpha[26][5] = {
-    {0x2,0x5,0x7,0x5,0x5}, /* A */ {0x6,0x5,0x6,0x5,0x6}, /* B */
-    {0x3,0x4,0x4,0x4,0x3}, /* C */ {0x6,0x5,0x5,0x5,0x6}, /* D */
-    {0x7,0x4,0x6,0x4,0x7}, /* E */ {0x7,0x4,0x6,0x4,0x4}, /* F */
-    {0x3,0x4,0x5,0x5,0x3}, /* G */ {0x5,0x5,0x7,0x5,0x5}, /* H */
-    {0x7,0x2,0x2,0x2,0x7}, /* I */ {0x1,0x1,0x1,0x5,0x2}, /* J */
-    {0x5,0x5,0x6,0x5,0x5}, /* K */ {0x4,0x4,0x4,0x4,0x7}, /* L */
-    {0x5,0x7,0x7,0x5,0x5}, /* M */ {0x5,0x7,0x7,0x7,0x5}, /* N */
-    {0x2,0x5,0x5,0x5,0x2}, /* O */ {0x6,0x5,0x6,0x4,0x4}, /* P */
-    {0x2,0x5,0x5,0x7,0x3}, /* Q */ {0x6,0x5,0x6,0x5,0x5}, /* R */
-    {0x3,0x4,0x2,0x1,0x6}, /* S */ {0x7,0x2,0x2,0x2,0x2}, /* T */
-    {0x5,0x5,0x5,0x5,0x7}, /* U */ {0x5,0x5,0x5,0x5,0x2}, /* V */
-    {0x5,0x5,0x7,0x7,0x5}, /* W */ {0x5,0x5,0x2,0x5,0x5}, /* X */
-    {0x5,0x5,0x2,0x2,0x2}, /* Y */ {0x7,0x1,0x2,0x4,0x7}, /* Z */
+    {0x2,0x5,0x7,0x5,0x5}, {0x6,0x5,0x6,0x5,0x6}, {0x3,0x4,0x4,0x4,0x3},
+    {0x6,0x5,0x5,0x5,0x6}, {0x7,0x4,0x6,0x4,0x7}, {0x7,0x4,0x6,0x4,0x4},
+    {0x3,0x4,0x5,0x5,0x3}, {0x5,0x5,0x7,0x5,0x5}, {0x7,0x2,0x2,0x2,0x7},
+    {0x1,0x1,0x1,0x5,0x2}, {0x5,0x5,0x6,0x5,0x5}, {0x4,0x4,0x4,0x4,0x7},
+    {0x5,0x7,0x7,0x5,0x5}, {0x5,0x7,0x7,0x7,0x5}, {0x2,0x5,0x5,0x5,0x2},
+    {0x6,0x5,0x6,0x4,0x4}, {0x2,0x5,0x5,0x7,0x3}, {0x6,0x5,0x6,0x5,0x5},
+    {0x3,0x4,0x2,0x1,0x6}, {0x7,0x2,0x2,0x2,0x2}, {0x5,0x5,0x5,0x5,0x7},
+    {0x5,0x5,0x5,0x5,0x2}, {0x5,0x5,0x7,0x7,0x5}, {0x5,0x5,0x2,0x5,0x5},
+    {0x5,0x5,0x2,0x2,0x2}, {0x7,0x1,0x2,0x4,0x7},
 };
 
 static const uint8_t g_digit[10][5] = {
@@ -97,7 +111,6 @@ static const uint8_t g_digit[10][5] = {
     {0x7,0x5,0x7,0x1,0x7},
 };
 
-/* Cell advance for one character at a given scale (3 columns + 1 gap). */
 #define CELL_W(scale) (4u * (scale))
 
 static const uint8_t* glyph_for(char c) {
@@ -123,12 +136,11 @@ static void draw_glyph(const uint8_t bm[5], uint16_t x, uint16_t y,
 static uint16_t text_w(const char* s, uint8_t scale) {
     uint16_t n = 0;
     for(const char* p = s; *p; p++) n++;
-    if(n == 0) return 0;
-    return (uint16_t)(n * CELL_W(scale) - scale);   /* drop trailing gap */
+    return n ? (uint16_t)(n * CELL_W(scale) - scale) : 0u;
 }
 
-/* Draw text with its left edge at x.  Does not clear behind itself — callers
- * wipe the region first, which is cheaper than painting every blank pixel. */
+/* Does not clear behind itself — callers wipe the region first, which is
+ * cheaper than painting every blank pixel of every glyph. */
 static void draw_text(const char* s, uint16_t x, uint16_t y,
                       uint8_t scale, uint16_t fg) {
     for(const char* p = s; *p; p++) {
@@ -144,8 +156,16 @@ static void draw_text_mid(const char* s, uint16_t y, uint8_t scale, uint16_t fg)
     draw_text(s, x, y, scale, fg);
 }
 
+static void num_str(char buf[4], uint32_t v) {
+    if(v > 999u) v = 999u;
+    buf[0] = (char)('0' + (v / 100u) % 10u);
+    buf[1] = (char)('0' + (v / 10u) % 10u);
+    buf[2] = (char)('0' + v % 10u);
+    buf[3] = '\0';
+}
+
 /* ===================================================================
- * RNG — same LCG the other examples use
+ * RNG
  * =================================================================== */
 static uint32_t g_seed = 0x51F0C0DEUL;
 
@@ -162,16 +182,10 @@ enum {
     MG_NOTAP,       /* do not press at all                              */
     MG_MASH,        /* press MASH_TARGET times                          */
     MG_HOLD,        /* be holding when the timer runs out               */
-    MG_WAIT,        /* wait for GO, then press — pressing early kills   */
-    MG_STOP,        /* press while the sweeping marker is in the green  */
+    MG_WAIT,        /* wait for GO, then press                          */
+    MG_STOP,        /* press while the sweeping marker is in the green   */
     MG_COUNT
 };
-
-/* Only TAP and NOTAP can lie: they are the pair that reads as a straight
- * swap, which is what makes the trick land instead of feeling arbitrary. */
-static uint8_t mg_can_lie(uint8_t mg) {
-    return (mg == MG_TAP || mg == MG_NOTAP) ? 1u : 0u;
-}
 
 static const char* mg_prompt(uint8_t mg) {
     switch(mg) {
@@ -201,23 +215,24 @@ static uint32_t g_best;
 static uint8_t  g_new_best;
 static uint8_t  g_lives;
 
-static uint8_t  g_mg;            /* active microgame                    */
-static uint16_t g_len_ms;        /* this round's length                 */
-static uint16_t g_t0;            /* ms_now() at round start             */
-static uint16_t g_result_t0;     /* ms_now() at result flash start      */
+static uint8_t  g_mg;
+static uint16_t g_len_ms;
+static uint16_t g_t0;
+static uint16_t g_result_t0;
 
-static uint8_t  g_lying;         /* prompt is currently showing a lie   */
-static uint16_t g_lie_at;        /* ms offset when the prompt flips     */
-static uint8_t  g_presses;       /* rising edges this round             */
-static uint8_t  g_settled;       /* round already decided (early fail)  */
-static uint8_t  g_passed;        /* outcome once settled                */
+static uint8_t  g_rev;           /* reverse rule active right now       */
+static uint16_t g_switch_at;     /* ms offset of a mid-round flip, or 0 */
+static uint8_t  g_switched;
+static uint8_t  g_presses;
+static uint8_t  g_settled;
+static uint8_t  g_passed;
 
-static uint16_t g_go_at;         /* MG_WAIT: when GO appears            */
+static uint16_t g_go_at;
 static uint8_t  g_go_shown;
-static uint8_t  g_zone_x;        /* MG_STOP: green zone left edge       */
+static uint8_t  g_zone_x;
 static uint8_t  g_zone_w;
-static int16_t  g_mark_prev;     /* MG_STOP: last marker x (-1 = none)  */
-static uint8_t  g_mash_prev;     /* last mash count drawn               */
+static int16_t  g_mark_prev;
+static uint8_t  g_mash_prev;
 
 static uint16_t g_bat_raw = BAT_FULL;
 
@@ -228,7 +243,18 @@ static uint16_t g_blink_t0;
 static uint8_t  g_blink_on;
 
 /* ===================================================================
- * Status bar — score on the left, remaining lives on the right
+ * Theme — the only cue for the reverse rule, and deliberately a loud one
+ * =================================================================== */
+static uint16_t theme_bg(void)  { return g_rev ? COL_REV    : COL_BG;  }
+static uint16_t theme_ink(void) { return g_rev ? COL_REVINK : COL_INK; }
+
+/* Apply the round's rule to a raw "did what the prompt literally said". */
+static uint8_t outcome(uint8_t did_as_told) {
+    return g_rev ? (uint8_t)(did_as_told ? 0u : 1u) : did_as_told;
+}
+
+/* ===================================================================
+ * Status bar
  * =================================================================== */
 static void draw_lives(void) {
     for(uint8_t i = 0; i < LIVES_START; i++) {
@@ -241,18 +267,18 @@ static void draw_score_bar(void) {
     display_fill_rect(0, 0, LCD_WIDTH, BAR_H, COL_BAR);
 
     char buf[4];
-    uint32_t s = (g_score > 999u) ? 999u : g_score;
-    buf[0] = (char)('0' + (s / 100u) % 10u);
-    buf[1] = (char)('0' + (s / 10u) % 10u);
-    buf[2] = (char)('0' + s % 10u);
-    buf[3] = '\0';
+    num_str(buf, g_score);
     draw_text(buf, 4, 3, 2, COL_CHROME);
+
+    /* Mirror the rule into the bar too, so the cue survives even when the
+     * play area is momentarily covered by a stage graphic. */
+    if(g_rev) draw_text("REV", 40, 3, 2, COL_RGB(200, 140, 255));
 
     draw_lives();
 }
 
 /* ===================================================================
- * Timer bar — shrinks left-to-right as the round runs out
+ * Timer bar
  * =================================================================== */
 static void draw_timer(uint16_t elapsed) {
     uint32_t left = (elapsed >= g_len_ms) ? 0u : (uint32_t)(g_len_ms - elapsed);
@@ -266,27 +292,34 @@ static void draw_timer(uint16_t elapsed) {
 }
 
 /* ===================================================================
- * Prompt + per-game stage furniture
+ * Prompt + stage
  * =================================================================== */
 static void draw_prompt(void) {
-    const char* text = mg_prompt(g_mg);
-
-    /* While lying, show the opposite instruction of the pair. */
-    if(g_lying) text = (g_mg == MG_TAP) ? "NO TAP" : "TAP";
-
-    display_fill_rect(0, PROMPT_Y, LCD_WIDTH, PROMPT_H, COL_BG);
-    draw_text_mid(text, PROMPT_Y, 4, COL_INK);
+    display_fill_rect(0, PROMPT_Y, LCD_WIDTH, PROMPT_H, theme_bg());
+    draw_text_mid(mg_prompt(g_mg), PROMPT_Y, 4, theme_ink());
 }
 
 static void draw_stage_static(void) {
-    display_fill_rect(0, STAGE_Y, LCD_WIDTH, STAGE_H, COL_BG);
+    display_fill_rect(0, STAGE_Y, LCD_WIDTH, STAGE_H, theme_bg());
 
     if(g_mg == MG_STOP) {
-        /* Track with the safe zone marked out. */
-        display_fill_rect(6, (uint16_t)(STAGE_Y + 18), (uint16_t)(LCD_WIDTH - 12), 8, COL_DIM);
+        display_fill_rect(6, (uint16_t)(STAGE_Y + 18),
+                          (uint16_t)(LCD_WIDTH - 12), 8, COL_DIM);
         display_fill_rect((uint16_t)(6 + g_zone_x), (uint16_t)(STAGE_Y + 18),
                           g_zone_w, 8, COL_WIN);
     }
+}
+
+/* Repaint everything the rule affects.  Used at round start and again if the
+ * round switches under the player. */
+static void draw_round_theme(void) {
+    display_fill_rect(0, BAR_H, LCD_WIDTH,
+                      (uint16_t)(LCD_HEIGHT - BAR_H), theme_bg());
+    draw_score_bar();
+    draw_prompt();
+    draw_stage_static();
+    g_mark_prev = -1;
+    g_mash_prev = 0xFF;
 }
 
 /* ===================================================================
@@ -300,32 +333,32 @@ static void round_begin(void) {
                    ? ROUND_MIN_MS
                    : (uint16_t)(ROUND_START_MS - shave);
 
-    /* Lie about a third of the time, once the player knows the rules. */
-    g_lying = 0;
-    g_lie_at = 0;
-    if(g_score + 1u >= LIE_FROM_ROUND && mg_can_lie(g_mg) && rnd(3) == 0) {
-        g_lying  = 1;
-        g_lie_at = (uint16_t)(g_len_ms / 2u);
+    /* Reverse gets more common as the run goes on, but never certain. */
+    g_rev = 0;
+    if(g_score + 1u >= REV_FROM_ROUND) {
+        uint32_t chance = 25u + g_score;          /* percent */
+        if(chance > 50u) chance = 50u;
+        g_rev = (rnd(100) < chance) ? 1u : 0u;
     }
 
-    g_presses  = 0;
-    g_settled  = 0;
-    g_passed   = 0;
-    g_go_shown = 0;
-    g_mash_prev = 0xFF;
-    g_mark_prev = -1;
+    /* Late rounds can flip the rule mid-way — visibly, so it is reactable. */
+    g_switch_at = 0;
+    g_switched  = 0;
+    if(g_score + 1u >= SWITCH_FROM_ROUND && rnd(4) == 0) {
+        g_switch_at = (uint16_t)(g_len_ms / 2u);
+    }
 
-    /* MG_WAIT: GO lands somewhere in the middle half of the round. */
+    g_presses   = 0;
+    g_settled   = 0;
+    g_passed    = 0;
+    g_go_shown  = 0;
+
     g_go_at = (uint16_t)(g_len_ms / 4u + rnd(g_len_ms / 2u));
 
-    /* MG_STOP: zone somewhere along the track, never flush to an edge. */
     g_zone_w = (uint8_t)(20 + rnd(14));
     g_zone_x = (uint8_t)(rnd((uint32_t)(LCD_WIDTH - 12 - g_zone_w)));
 
-    display_fill_rect(0, BAR_H, LCD_WIDTH, (uint16_t)(LCD_HEIGHT - BAR_H), COL_BG);
-    draw_score_bar();
-    draw_prompt();
-    draw_stage_static();
+    draw_round_theme();
     draw_timer(0);
 
     g_t0 = ms_now();
@@ -341,18 +374,12 @@ static void game_begin(void) {
 }
 
 /* ===================================================================
- * Screens
+ * Title — animated, repainting only what changes
  * =================================================================== */
-/* ── Title ────────────────────────────────────────────────────────────
- * Animated, but only the parts that actually change are repainted: the ten
- * title letters, the border, and the blinking prompt.  Everything is drawn
- * over itself in a new colour rather than cleared first — the set pixels are
- * in the same places each pass, so there is nothing to erase.            */
-
-#define TITLE_X      16     /* 5 chars at scale 5 = 95 px wide, centred   */
+#define TITLE_X      16
 #define TITLE_Y1     34
 #define TITLE_Y2     70
-#define TITLE_STEP   20     /* CELL_W(5)                                  */
+#define TITLE_STEP   20     /* CELL_W(5) */
 #define PROMPT_BLINK 480u
 #define HUE_STEP     140u
 
@@ -381,7 +408,7 @@ static void title_border(uint8_t off) {
 
 static void title_prompt(uint8_t on) {
     display_fill_rect(6, 122, (uint16_t)(LCD_WIDTH - 12), 16, COL_TBG);
-    if(on) draw_text_mid("TAP", 122, 3, COL_INK);
+    if(on) draw_text_mid("TAP", 122, 3, COL_WHITE);
 }
 
 static void draw_title(void) {
@@ -392,22 +419,27 @@ static void draw_title(void) {
 
     if(g_best) {
         char buf[4];
-        uint32_t b = (g_best > 999u) ? 999u : g_best;
-        buf[0] = (char)('0' + (b / 100u) % 10u);
-        buf[1] = (char)('0' + (b / 10u) % 10u);
-        buf[2] = (char)('0' + b % 10u);
-        buf[3] = '\0';
+        num_str(buf, g_best);
         draw_text_mid(buf, 144, 2, COL_GOLD);
     }
 }
 
-/* ── How to play ──────────────────────────────────────────────────────
- * Six rows: the prompt as it appears in-game on the left, what it actually
- * wants on the right.  Static, drawn once.                               */
+static void enter_title(void) {
+    g_state    = ST_TITLE;
+    g_hue      = 0;
+    g_blink_on = 1;
+    draw_title();
+    g_hue_t0   = ms_now();
+    g_blink_t0 = g_hue_t0;
+}
+
+/* ===================================================================
+ * How to play
+ * =================================================================== */
 static void draw_howto(void) {
     display_fill(COL_BG);
 
-    draw_text_mid("HOW TO", 8, 3, COL_INK);
+    draw_text_mid("HOW TO", 4, 3, COL_INK);
 
     static const char* const name[6] = {
         "TAP", "NO TAP", "MASH", "HOLD", "WAIT", "STOP"
@@ -417,14 +449,28 @@ static void draw_howto(void) {
     };
 
     for(uint8_t i = 0; i < 6; i++) {
-        uint16_t y = (uint16_t)(34 + i * 16);
+        uint16_t y = (uint16_t)(24 + i * 16);
         draw_text(name[i], 6, y, 2, g_pal[i]);
         draw_text(want[i], 58, y, 2, COL_INK);
     }
 
-    /* The one rule that is not obvious from playing. */
-    draw_text_mid("PROMPTS LIE", 134, 2, COL_LOSE);
+    /* The rule that carries the whole game — shown on its own colour so it
+     * reads the same way here as it will in play. */
+    display_fill_rect(4, 118, (uint16_t)(LCD_WIDTH - 8), 28, COL_REV);
+    draw_text_mid("PURPLE MEANS", 122, 2, COL_REVINK);
+    draw_text_mid("DO THE OPPOSITE", 134, 2, COL_REVINK);
+
     draw_text_mid("TAP TO START", 150, 2, COL_DIM);
+}
+
+/* ===================================================================
+ * Result / game over
+ * =================================================================== */
+static void draw_result(uint8_t passed) {
+    display_fill_rect(0, BAR_H, LCD_WIDTH, (uint16_t)(LCD_HEIGHT - BAR_H),
+                      passed ? COL_WIN : COL_LOSE);
+    draw_text_mid(passed ? "OK" : "MISS", 60, 5, COL_WHITE);
+    draw_score_bar();
 }
 
 static void draw_over(void) {
@@ -433,36 +479,12 @@ static void draw_over(void) {
     draw_text_mid("OVER", 54, 4, COL_INK);
 
     char buf[4];
-    uint32_t s = (g_score > 999u) ? 999u : g_score;
-    buf[0] = (char)('0' + (s / 100u) % 10u);
-    buf[1] = (char)('0' + (s / 10u) % 10u);
-    buf[2] = (char)('0' + s % 10u);
-    buf[3] = '\0';
+    num_str(buf, g_score);
     draw_text_mid(buf, 88, 4, COL_INK);
 
     draw_text_mid("BEST", 122, 2, COL_GOLD);
-    uint32_t b = (g_best > 999u) ? 999u : g_best;
-    buf[0] = (char)('0' + (b / 100u) % 10u);
-    buf[1] = (char)('0' + (b / 10u) % 10u);
-    buf[2] = (char)('0' + b % 10u);
+    num_str(buf, g_best);
     draw_text_mid(buf, 138, 2, COL_GOLD);
-}
-
-static void draw_result(uint8_t passed) {
-    display_fill_rect(0, BAR_H, LCD_WIDTH, (uint16_t)(LCD_HEIGHT - BAR_H),
-                      passed ? COL_WIN : COL_LOSE);
-    draw_text_mid(passed ? "OK" : "MISS", 60, 5, COL_WHITE);
-    draw_score_bar();
-}
-
-/* Enter the title screen and reset its animation clocks. */
-static void enter_title(void) {
-    g_state    = ST_TITLE;
-    g_hue      = 0;
-    g_blink_on = 1;
-    draw_title();
-    g_hue_t0   = ms_now();
-    g_blink_t0 = g_hue_t0;
 }
 
 /* ===================================================================
@@ -474,17 +496,18 @@ static void settle(uint8_t passed) {
     g_passed  = passed;
 }
 
-/* Evaluate whatever state the round ended in. */
+/* Evaluate however the round ended.  Each case computes "did what the prompt
+ * literally said", and outcome() applies the reverse rule on top. */
 static uint8_t judge(void) {
     if(g_settled) return g_passed;
 
     switch(g_mg) {
-    case MG_TAP:   return (g_presses > 0) ? 1u : 0u;
-    case MG_NOTAP: return (g_presses == 0) ? 1u : 0u;
-    case MG_MASH:  return (g_presses >= MASH_TARGET) ? 1u : 0u;
-    case MG_HOLD:  return button_pressed() ? 1u : 0u;
-    case MG_WAIT:  return 0u;   /* never pressed after GO → miss */
-    default:       return 0u;   /* MG_STOP: never pressed → miss */
+    case MG_TAP:   return outcome((g_presses > 0) ? 1u : 0u);
+    case MG_NOTAP: return outcome((g_presses == 0) ? 1u : 0u);
+    case MG_MASH:  return outcome((g_presses >= MASH_TARGET) ? 1u : 0u);
+    case MG_HOLD:  return outcome(button_pressed() ? 1u : 0u);
+    case MG_WAIT:  return outcome(0u);   /* never pressed → did not obey */
+    default:       return outcome(0u);   /* MG_STOP: never pressed       */
     }
 }
 
@@ -514,8 +537,7 @@ static void on_hard_reset(void) {
         nv_write(NV_KEY_MICRO_BEST, g_best);
         g_new_best = 0;
     }
-    g_state = ST_TITLE;
-    draw_title();
+    enter_title();
 }
 
 void app_init(void) {
@@ -527,18 +549,15 @@ void app_init(void) {
     g_best    = nv_read(NV_KEY_MICRO_BEST, 0);
     g_bat_raw = bat_read_raw();
 
-    g_state = ST_TITLE;
     display_fill(COL_BLACK);
-    draw_title();
+    enter_title();
 }
 
 void app_update(uint32_t frame) {
     (void)frame;
 
-    /* Sticky press latch: a tap shorter than a frame still counts.  Cleared
-     * only once the round logic has consumed it. */
     static uint8_t s_prev = 0;
-    uint8_t btn = button_raw();
+    uint8_t btn  = button_raw();
     uint8_t edge = (btn && !s_prev) ? 1u : 0u;
     s_prev = btn;
 
@@ -551,8 +570,6 @@ void app_update(uint32_t frame) {
             draw_howto();
             break;
         }
-        /* Cycle the letter/border hues and blink the prompt on their own
-         * schedules, so the screen never sits still. */
         if((uint16_t)(ms_now() - g_hue_t0) >= HUE_STEP) {
             g_hue_t0 = ms_now();
             g_hue++;
@@ -575,15 +592,16 @@ void app_update(uint32_t frame) {
     case ST_PLAY: {
         uint16_t elapsed = (uint16_t)(ms_now() - g_t0);
 
-        /* The lie flips to the truth partway through. */
-        if(g_lying && elapsed >= g_lie_at) {
-            g_lying = 0;
-            draw_prompt();
+        /* Mid-round switch: flip the rule and repaint so the player can see
+         * it happen and still react.  Any early settle already stands. */
+        if(g_switch_at && !g_switched && elapsed >= g_switch_at) {
+            g_switched = 1;
+            g_rev = g_rev ? 0u : 1u;
+            draw_round_theme();
         }
 
         if(edge) g_presses++;
 
-        /* Games that can be decided before the timer expires. */
         switch(g_mg) {
         case MG_WAIT:
             if(!g_go_shown && elapsed >= g_go_at) {
@@ -591,52 +609,57 @@ void app_update(uint32_t frame) {
                 display_fill_rect(0, STAGE_Y, LCD_WIDTH, STAGE_H, COL_GO);
                 draw_text_mid("GO", (uint16_t)(STAGE_Y + 12), 4, COL_WHITE);
             }
-            if(edge) settle(g_go_shown ? 1u : 0u);   /* early press = death */
+            /* Obeying WAIT means pressing only after GO. */
+            if(edge) settle(outcome(g_go_shown ? 1u : 0u));
             break;
 
         case MG_STOP: {
-            /* Marker sweeps the track once, left to right. */
             uint16_t span = (uint16_t)(LCD_WIDTH - 12);
             uint16_t mx = (uint16_t)(((uint32_t)elapsed * span) / g_len_ms);
             if(mx >= span) mx = (uint16_t)(span - 1);
 
             if((int16_t)mx != g_mark_prev) {
                 if(g_mark_prev >= 0) {
-                    /* Repaint the vacated column back to track or zone. */
                     uint16_t px = (uint16_t)g_mark_prev;
                     uint8_t in_zone = (px >= g_zone_x && px < g_zone_x + g_zone_w);
                     display_fill_rect((uint16_t)(6 + px), (uint16_t)(STAGE_Y + 18),
                                       3, 8, in_zone ? COL_WIN : COL_DIM);
                 }
                 display_fill_rect((uint16_t)(6 + mx), (uint16_t)(STAGE_Y + 14),
-                                  3, 16, COL_INK);
+                                  3, 16, theme_ink());
                 g_mark_prev = (int16_t)mx;
             }
 
-            if(edge) settle((mx >= g_zone_x && mx < g_zone_x + g_zone_w) ? 1u : 0u);
+            if(edge) {
+                uint8_t in_zone = (mx >= g_zone_x && mx < g_zone_x + g_zone_w);
+                settle(outcome(in_zone));
+            }
             break;
         }
 
         case MG_MASH:
             if(g_presses != g_mash_prev) {
                 g_mash_prev = g_presses;
-                display_fill_rect(0, STAGE_Y, LCD_WIDTH, STAGE_H, COL_BG);
+                display_fill_rect(0, STAGE_Y, LCD_WIDTH, STAGE_H, theme_bg());
                 char buf[3];
                 uint8_t n = (g_presses > 99u) ? 99u : g_presses;
                 buf[0] = (char)('0' + (n / 10u));
                 buf[1] = (char)('0' + (n % 10u));
                 buf[2] = '\0';
                 draw_text_mid(buf, (uint16_t)(STAGE_Y + 10), 4,
-                              (g_presses >= MASH_TARGET) ? COL_WIN : COL_INK);
+                              (g_presses >= MASH_TARGET) ? COL_WIN : theme_ink());
             }
-            if(g_presses >= MASH_TARGET) settle(1);
+            if(g_presses >= MASH_TARGET) settle(outcome(1u));
             break;
 
         case MG_NOTAP:
-            /* Pressing decides it immediately — but only against the prompt
-             * that is true at the moment of the press.  Pressing while the
-             * lie is still up is survivable; that is the whole joke. */
-            if(edge && !g_lying) settle(0);
+            /* Pressing settles it immediately, under whichever rule is up at
+             * the moment of the press. */
+            if(edge) settle(outcome(0u));
+            break;
+
+        case MG_TAP:
+            if(edge) settle(outcome(1u));
             break;
 
         default:
@@ -668,14 +691,10 @@ void app_update(uint32_t frame) {
 
     /* -------------------------------------------------------------- */
     case ST_OVER:
-        if(edge) {
-            g_state = ST_TITLE;
-            draw_title();
-        }
+        if(edge) enter_title();
         break;
     }
 
-    /* Battery refresh every ~5 s, only while idle screens are up. */
     if((frame % 150u) == 0u && (g_state == ST_TITLE || g_state == ST_OVER)) {
         g_bat_raw = bat_read_raw();
     }
@@ -683,11 +702,10 @@ void app_update(uint32_t frame) {
 
 void app_wake(void) {
     switch(g_state) {
-    case ST_TITLE: draw_title(); break;
-    case ST_OVER:  draw_over();  break;
+    case ST_OVER: draw_over(); break;
     default:
-        /* Do not resume a round that was interrupted by sleep — the timer
-         * reference is long gone and the player never saw it. */
+        /* Never resume a round interrupted by sleep — the timer reference is
+         * long gone and the player never saw it run. */
         enter_title();
         break;
     }
