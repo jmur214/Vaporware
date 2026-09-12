@@ -1,34 +1,35 @@
 /* crawl.c — one-button dungeon crawler for RAZ DC25000
  *           (N32G031K8Q7-1 + GC9107 128x160 LCD, Vaporware SDK)
  *
- * ── The problem this design exists to solve ──────────────────────────────
- * A one-button fighter collapses instantly if guarding is free.  Hold guard,
- * wait for the recovery window, tap twice, repeat — every fight identical,
- * every enemy a different-coloured wall.  So guard costs STAMINA, and that
- * single rule is what the whole game hangs off:
+ * ── Design: why guarding costs something ─────────────────────────────────
+ * A one-button fighter collapses if guarding is free — hold guard, release on
+ * the recovery window, repeat, and every enemy is the same wall.  So guard
+ * burns STAMINA: it is a burst, never a stance.  Run it dry and your guard
+ * BREAKS.  A parry refunds stamina, so reading well is what funds the next
+ * read.  Enemies FEINT (the wind-up stalls) to punish guarding on sight, and
+ * attack in COMBOS of 1-3 so recovery has to be earned.
  *
- *   Guard drains fast and refills slowly, so it is a burst, never a stance.
- *   Run it to zero and your guard BREAKS — stunned, and hit for extra.
- *   A parry refunds stamina, so reading well is what pays for reading again.
+ * ── Design: why the animation layer is this elaborate ────────────────────
+ * The whole game is "press at the right moment", so every moment has to be
+ * legible and every press has to feel like it hit something.  That is not
+ * decoration, it is the interface:
  *
- * Now the question stops being "am I holding" and becomes "can I afford to
- * hold, right now, for this long".  Guarding early to be safe is exactly what
- * kills you, which is why enemies FEINT: the wind-up stalls partway and the
- * player who guarded on sight is empty when the hit finally lands.
+ *   HITSTOP   — the world freezes ~4 frames on contact.  One technique, and
+ *               it does more for impact than any amount of extra art.
+ *   PARRY ZONE— the telegraph bar shows the window you must press in, so the
+ *               timing is a thing you can learn instead of guess.  A feint
+ *               visibly slides the zone, which is what makes it fair.
+ *   SMEAR     — the sword's first frame is already extended with an arc
+ *               streak behind it, so the swing animates without ever costing
+ *               the player a frame of input latency.
+ *   SHIELD    — stamina is drawn as the fill level of the shield itself, so
+ *               the resource lives where your eye already is.
+ *   GHOST BAR — health drains behind a trailing white bar, so a big hit reads
+ *               as big even after the number is gone.
  *
- * Attacks come in COMBOS of one to three, so recovery windows are earned
- * rather than handed out every few seconds, and stamina has to last a whole
- * exchange rather than one hit.
- *
- * Two attack colours remain the core read — white guards, red must NOT be
- * guarded — but they now appear mid-combo, so a single sequence can demand
- * guard, release, guard again on a rhythm.
- *
- * ── Structure ────────────────────────────────────────────────────────────
- * Between rooms you pick one of two doors, so the run is a series of choices
- * rather than a corridor: fight, elite, treasure or rest.  Treasure offers a
- * choice of two items, which is where a build comes from.  Everything you
- * carry shows on the HUD, because an upgrade you cannot see is not a reward.
+ * Everything animates out of dirty rectangles: each actor owns a box, the box
+ * is repainted with floor/wall, then the pose is drawn.  Full-screen fills are
+ * ~50 ms and never happen mid-fight.
  *
  * Controls — TAP attack / choose, HOLD guard / confirm.  Permadeath.
  */
@@ -41,56 +42,76 @@
  * Palette
  * =================================================================== */
 #define COL_BG      COL_RGB( 18,  16,  26)
-#define COL_STONE   COL_RGB( 56,  52,  72)
-#define COL_FLOOR   COL_RGB( 42,  38,  54)
+#define COL_WALL    COL_RGB( 40,  36,  54)
+#define COL_FLOOR   COL_RGB( 46,  41,  58)
 #define COL_INK     COL_RGB(238, 238, 246)
 #define COL_DIM     COL_RGB(126, 122, 146)
 #define COL_HP      COL_RGB( 70, 205, 100)
 #define COL_HPLOW   COL_RGB(225,  60,  50)
+#define COL_GHOST   COL_RGB(245, 235, 200)
 #define COL_STAM    COL_RGB( 80, 165, 255)
 #define COL_STAMLOW COL_RGB(255, 150,  40)
 #define COL_EHP     COL_RGB(200,  60,  70)
-#define COL_TRACK   COL_RGB( 38,  36,  50)
+#define COL_TRACK   COL_RGB( 34,  32,  46)
+#define COL_ZONE    COL_RGB( 96,  80,  20)
 #define COL_WARN    COL_RGB(245, 240, 220)
 #define COL_BREAK   COL_RGB(240,  50,  40)
-#define COL_FEINT   COL_RGB(150, 140, 110)
+#define COL_FEINT   COL_RGB(120, 112,  90)
 #define COL_GOLD    COL_RGB(255, 205,   0)
-#define COL_HERO    COL_RGB(210, 215, 235)
-#define COL_BLADE   COL_RGB(180, 220, 255)
+#define COL_HERO    COL_RGB(206, 212, 232)
+#define COL_HEROD   COL_RGB(150, 156, 178)
+#define COL_BLADE   COL_RGB(196, 228, 255)
 #define COL_FLASH   COL_RGB(255, 255, 255)
-#define COL_SEL     COL_RGB(255, 205,   0)
+#define COL_SPARK   COL_RGB(255, 236, 160)
+#define COL_TORCH   COL_RGB(255, 170,  40)
+#define COL_SEL_BAR COL_RGB(255, 205,   0)
 
 /* ===================================================================
  * Layout
  * =================================================================== */
 #define HP_Y         4
 #define STAM_Y      13
-#define EBAR_Y      24
-#define FLOAT_Y     36
-#define SCENE_Y     48
-#define SCENE_H     64
-#define GROUND_Y   (SCENE_Y + SCENE_H - 10)
+#define EBAR_Y      22
+#define FLOAT_Y     34
+#define SCENE_Y     46
+#define SCENE_H     68
+#define GROUND_Y   (SCENE_Y + SCENE_H - 12)
 #define TELE_Y     118
-#define TELE_H      10
+#define TELE_H      11
 #define MSG_Y      134
 
 #define HERO_X      20
-#define ENEMY_X     84
+#define ENEMY_X     82
+
+/* Dirty boxes.  Sized to the widest pose plus shake padding. */
+#define HB_X   12
+#define HB_Y   58
+#define HB_W   46
+#define HB_H   48
+#define FB_X   66
+#define FB_Y   60
+#define FB_W   50
+#define FB_H   46
 
 /* ===================================================================
- * Tuning — the numbers that define the fight
+ * Tuning
  * =================================================================== */
 #define TAP_MAX      170u
 #define GUARD_ARM    170u
-#define PARRY_MS     260u
+#define PARRY_MS     280u
 #define SWING_CD     230u
 
 #define STAM_MAX     100
-#define STAM_DRAIN     2     /* per frame guarding, ~60/s: 1.7 s of guard */
-#define STAM_REGEN     1     /* per frame free,     ~30/s: 3.3 s to refill */
+#define STAM_DRAIN     2
+#define STAM_REGEN     1
 #define STAM_BLOCK    18
 #define STAM_PARRY    30
 #define BREAK_MS     900u
+
+#define HITSTOP_HIT    3
+#define HITSTOP_BIG    6
+
+#define NPART          12
 
 #define NV_KEY_BEST  NV_KEY_APP_1
 
@@ -159,26 +180,61 @@ static uint8_t num_str(char b[4], uint16_t v) {
     return n;
 }
 
+/* ===================================================================
+ * Maths
+ * =================================================================== */
 static uint32_t g_seed = 0xD0465EEDUL;
 static uint32_t rnd(uint32_t m) {
     g_seed = g_seed * 1664525UL + 1013904223UL;
     return (g_seed >> 16) % m;
 }
+
+/* 16-step sine, Q7.  Index 0 = +x, 4 = +y (screen down), 12 = up. */
+static const int8_t g_sin16[16] = {
+    0, 49, 90, 117, 127, 117, 90, 49, 0, -49, -90, -117, -127, -117, -90, -49
+};
+static int16_t isin(uint8_t i) { return g_sin16[i & 15u]; }
+static int16_t icos(uint8_t i) { return g_sin16[(i + 4u) & 15u]; }
+
+static void px_rect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t col) {
+    if(x < 0) { w = (int16_t)(w + x); x = 0; }
+    if(y < 0) { h = (int16_t)(h + y); y = 0; }
+    if(x + w > LCD_WIDTH)  w = (int16_t)(LCD_WIDTH - x);
+    if(y + h > LCD_HEIGHT) h = (int16_t)(LCD_HEIGHT - y);
+    if(w > 0 && h > 0)
+        display_fill_rect((uint16_t)x, (uint16_t)y, (uint16_t)w, (uint16_t)h, col);
+}
+
 static void fill_circle(int16_t cx, int16_t cy, int16_t r, uint16_t col) {
     for(int16_t dy = -r; dy <= r; dy++) {
-        int16_t y = (int16_t)(cy + dy);
-        if(y < 0 || y >= LCD_HEIGHT) continue;
         int16_t h = 0;
         while((int16_t)((h + 1) * (h + 1) + dy * dy) <= (int16_t)(r * r)) h++;
-        int16_t x0 = (int16_t)(cx - h), w = (int16_t)(h * 2 + 1);
-        if(x0 < 0) { w = (int16_t)(w + x0); x0 = 0; }
-        if(x0 + w > LCD_WIDTH) w = (int16_t)(LCD_WIDTH - x0);
-        if(w > 0) display_fill_rect((uint16_t)x0, (uint16_t)y, (uint16_t)w, 1, col);
+        px_rect((int16_t)(cx - h), (int16_t)(cy + dy), (int16_t)(h * 2 + 1), 1, col);
     }
 }
 
+/* Thick Bresenham — the sword, and every angled thing on screen. */
+static void draw_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                      int16_t t, uint16_t col) {
+    int16_t dx = (int16_t)(x1 - x0), dy = (int16_t)(y1 - y0);
+    int16_t ax = dx < 0 ? (int16_t)-dx : dx, ay = dy < 0 ? (int16_t)-dy : dy;
+    int16_t n  = (ax > ay ? ax : ay);
+    if(n == 0) { px_rect(x0, y0, t, t, col); return; }
+    for(int16_t i = 0; i <= n; i++)
+        px_rect((int16_t)(x0 + (int32_t)dx * i / n),
+                (int16_t)(y0 + (int32_t)dy * i / n), t, t, col);
+}
+
+/* Dotted arc — the swing smear, and the parry burst. */
+static void draw_arc(int16_t cx, int16_t cy, int16_t r,
+                     uint8_t a0, uint8_t a1, int16_t t, uint16_t col) {
+    for(uint8_t a = a0; a != (uint8_t)((a1 + 1u) & 15u); a = (uint8_t)((a + 1u) & 15u))
+        px_rect((int16_t)(cx + (r * icos(a) >> 7)),
+                (int16_t)(cy + (r * isin(a) >> 7)), t, t, col);
+}
+
 /* ===================================================================
- * Bestiary — each entry is a rhythm, not a stat block
+ * Bestiary
  * =================================================================== */
 typedef struct {
     const char* name;
@@ -192,14 +248,14 @@ typedef struct {
 static const Foe g_foe[5] = {
 /*  name       hp hp+ atk a+4 wind wmin recov  gap brk fnt cmb colour        */
   { "SLIME",    9,  2,  2,  1, 1000, 640,  780, 300,  0,  0, 1, COL_RGB( 90,205,110) },
-  { "RAT",      7,  2,  2,  1,  520, 340,  520, 220, 10, 15, 2, COL_RGB(170,120, 80) },
-  { "SKELETON",12,  3,  3,  1,  820, 520,  660, 280, 30, 25, 2, COL_RGB(225,228,215) },
-  { "ORC",     18,  4,  5,  2, 1180, 780,  920, 360, 45, 20, 2, COL_RGB( 95,150, 85) },
-  { "WRAITH",  13,  3,  4,  2,  620, 400,  560, 200, 55, 40, 3, COL_RGB(170,110,235) },
+  { "RAT",      7,  2,  2,  1,  520, 340,  520, 220, 10, 15, 2, COL_RGB(178,126, 82) },
+  { "SKELETON",12,  3,  3,  1,  820, 520,  660, 280, 30, 25, 2, COL_RGB(226,229,216) },
+  { "ORC",     18,  4,  5,  2, 1180, 780,  920, 360, 45, 20, 2, COL_RGB( 96,152, 86) },
+  { "WRAITH",  13,  3,  4,  2,  620, 400,  560, 200, 55, 40, 3, COL_RGB(174,114,238) },
 };
 
 /* ===================================================================
- * Items — visible, because an upgrade you cannot see is not a reward
+ * Items
  * =================================================================== */
 #define IT_ATK    0
 #define IT_ARMOR  1
@@ -237,16 +293,15 @@ static const char* const g_item_desc[IT_COUNT] = {
 #define RM_STAIR 4
 
 static uint8_t  g_state;
-static uint16_t g_hp, g_maxhp;
+static uint16_t g_hp, g_maxhp, g_hp_ghost;
 static int16_t  g_stam, g_stammax;
 static uint8_t  g_atk, g_armor, g_floor, g_best;
 static uint8_t  g_room, g_rooms;
 
-static uint8_t  g_door[2], g_sel;
-static uint8_t  g_pick[2];
+static uint8_t  g_door[2], g_sel, g_pick[2];
 
 static uint8_t  g_ftype, g_elite;
-static uint16_t g_ehp, g_emaxhp;
+static uint16_t g_ehp, g_emaxhp, g_ehp_ghost;
 static uint8_t  g_eatk;
 static uint16_t g_ewind, g_erecov, g_egap;
 static uint8_t  g_ebreak, g_efeint, g_ecombo;
@@ -255,190 +310,397 @@ static uint8_t  g_phase, g_is_break, g_combo_left, g_followup;
 static uint8_t  g_feint_at, g_feinted;
 static uint16_t g_ph_t0, g_ph_dur;
 
-static uint8_t  g_guard, g_swinging, g_broken;
+static uint8_t  g_guard, g_broken, g_dying;
 static uint16_t g_guard_t0, g_swing_t0, g_broke_t0;
+
+/* animation */
+static uint8_t  g_swing_f;        /* 0 = idle, 1..5 = swing frame          */
+static uint8_t  g_hitstop;        /* frames the world is frozen            */
+static uint8_t  g_shake;
+static uint8_t  g_h_flash, g_e_flash;
+static int16_t  g_hx, g_ex;       /* actor x offsets (knockback / lunge)   */
+static uint8_t  g_death_f;
+static uint8_t  g_bob;
+
+static uint16_t g_tele_w;         /* last filled telegraph width           */
+static int16_t  g_zone_x;
 
 static uint8_t  g_pressing, g_press_used;
 static uint16_t g_press_t0;
 
 static uint16_t g_msg_t0;
-static uint8_t  g_float_n, g_float_crit;
-static uint16_t g_float_t0;
+static uint8_t  g_float_n, g_float_crit, g_float_f;
 
-static int16_t  g_drawn_tele = -1;
 static uint16_t g_bat_raw = BAT_FULL;
 
-/* ===================================================================
- * Bars
- * =================================================================== */
-static void draw_bars(void) {
-    display_fill_rect(0, 0, LCD_WIDTH, 22, COL_BG);
-
-    display_fill_rect(4, HP_Y, 84, 7, COL_TRACK);
-    uint32_t w = ((uint32_t)g_hp * 84u) / (g_maxhp ? g_maxhp : 1u);
-    if(w) display_fill_rect(4, HP_Y, (uint16_t)w, 7,
-                            (g_hp * 4u <= g_maxhp) ? COL_HPLOW : COL_HP);
-
-    /* Stamina sits directly under health because it is just as lethal —
-     * running it dry is what gets you killed, not chip damage. */
-    display_fill_rect(4, STAM_Y, 84, 5, COL_TRACK);
-    int32_t s = g_stam < 0 ? 0 : g_stam;
-    w = ((uint32_t)s * 84u) / (uint32_t)g_stammax;
-    if(w) display_fill_rect(4, STAM_Y, (uint16_t)w, 5,
-                            (s * 4 <= g_stammax) ? COL_STAMLOW : COL_STAM);
-
-    char b[4];
-    uint8_t n = num_str(b, g_floor);
-    draw_text("F", 92, HP_Y, 2, COL_DIM);
-    draw_span(b, n, 100, HP_Y, 2, COL_INK);
-
-    n = num_str(b, g_atk);
-    draw_text("A", 92, STAM_Y - 1, 1, COL_DIM);
-    draw_span(b, n, 98, STAM_Y - 1, 1, COL_GOLD);
-    n = num_str(b, g_armor);
-    draw_text("D", 110, STAM_Y - 1, 1, COL_DIM);
-    draw_span(b, n, 116, STAM_Y - 1, 1, COL_STAM);
-}
-
-static void draw_ebar(void) {
-    display_fill_rect(0, EBAR_Y - 2, LCD_WIDTH, 12, COL_BG);
-    if(g_ehp == 0u) return;
-    draw_text(g_foe[g_ftype].name, 4, EBAR_Y, 1, COL_DIM);
-    if(g_elite) draw_text("ELITE", 98, EBAR_Y, 1, COL_GOLD);
-    display_fill_rect(4, (uint16_t)(EBAR_Y + 6), 120, 4, COL_TRACK);
-    uint32_t w = ((uint32_t)g_ehp * 120u) / (g_emaxhp ? g_emaxhp : 1u);
-    if(w) display_fill_rect(4, (uint16_t)(EBAR_Y + 6), (uint16_t)w, 4, COL_EHP);
-}
-
-/* Damage numbers get a dedicated strip so they never fight the sprites for
- * pixels — clearing one is a single flat fill. */
-static void draw_float(void) {
-    display_fill_rect(0, FLOAT_Y, LCD_WIDTH, 10, COL_BG);
-    if(!g_float_n) return;
-    char b[4];
-    uint8_t n = num_str(b, g_float_n);
-    draw_span(b, n, ENEMY_X + 4, FLOAT_Y, 2, g_float_crit ? COL_GOLD : COL_INK);
-    if(g_float_crit) draw_text("CRIT", ENEMY_X + 24, FLOAT_Y + 2, 1, COL_GOLD);
-}
-
-static void pop_float(uint8_t dmg, uint8_t crit) {
-    g_float_n = dmg; g_float_crit = crit; g_float_t0 = ms_now();
-    draw_float();
-}
+typedef struct { int16_t x, y, vx, vy, ox, oy; uint8_t life; uint16_t col; } Part;
+static Part g_part[NPART];
 
 /* ===================================================================
- * Sprites
+ * Scene background
  * =================================================================== */
-static void draw_hero(void) {
-    display_fill_rect(HERO_X - 10, SCENE_Y + 2, 42, SCENE_H - 8, COL_BG);
-    uint16_t base = GROUND_Y;
-    uint16_t c = g_broken ? COL_HPLOW : COL_HERO;
-
-    display_fill_rect(HERO_X + 2, (uint16_t)(base - 8), 4, 8, c);
-    display_fill_rect(HERO_X + 8, (uint16_t)(base - 8), 4, 8, c);
-    display_fill_rect(HERO_X + 1, (uint16_t)(base - 21), 12, 13, c);
-    display_fill_rect(HERO_X + 3, (uint16_t)(base - 30), 9, 9, c);
-    display_fill_rect(HERO_X + 9, (uint16_t)(base - 27), 3, 2, COL_BG);
-
-    if(g_broken) {
-        draw_text("BROKEN", HERO_X - 8, SCENE_Y + 4, 1, COL_HPLOW);
-    } else if(g_guard) {
-        uint16_t gc = (g_stam * 4 <= g_stammax) ? COL_STAMLOW : COL_STAM;
-        display_fill_rect(HERO_X + 14, (uint16_t)(base - 25), 5, 17, gc);
-        display_fill_rect(HERO_X + 13, (uint16_t)(base - 21), 2, 9, gc);
-    } else if(g_swinging) {
-        display_fill_rect(HERO_X + 14, (uint16_t)(base - 23), 21, 3, COL_BLADE);
-        display_fill_rect(HERO_X + 31, (uint16_t)(base - 27), 3, 9, COL_BLADE);
-    } else {
-        display_fill_rect(HERO_X + 14, (uint16_t)(base - 17), 3, 13, COL_BLADE);
+static void scene_clear(int16_t x, int16_t y, int16_t w, int16_t h) {
+    if(x < 0) { w = (int16_t)(w + x); x = 0; }
+    if(y < SCENE_Y) { h = (int16_t)(h - (SCENE_Y - y)); y = SCENE_Y; }
+    if(x + w > LCD_WIDTH) w = (int16_t)(LCD_WIDTH - x);
+    if(y + h > SCENE_Y + SCENE_H) h = (int16_t)(SCENE_Y + SCENE_H - y);
+    if(w <= 0 || h <= 0) return;
+    if(y < GROUND_Y) {
+        int16_t hh = (int16_t)((y + h > GROUND_Y) ? (GROUND_Y - y) : h);
+        px_rect(x, y, w, hh, COL_BG);
+    }
+    if(y + h > GROUND_Y) {
+        int16_t y2 = (int16_t)(y > GROUND_Y ? y : GROUND_Y);
+        px_rect(x, y2, w, (int16_t)((y + h) - y2), COL_FLOOR);
     }
 }
 
-static void draw_foe_at(uint16_t col) {
-    display_fill_rect(ENEMY_X - 6, SCENE_Y + 2, 44, SCENE_H - 6, COL_BG);
-    if(g_ehp == 0u) return;
-
-    uint16_t base = GROUND_Y;
-    int16_t lean = (g_phase == EP_WIND) ? 5 : 0;
-    uint16_t x = (uint16_t)(ENEMY_X + lean);
-
-    switch(g_ftype) {
-    case 0:
-        fill_circle((int16_t)(x + 10), (int16_t)(base - 9), g_elite ? 12 : 10, col);
-        display_fill_rect((uint16_t)(x + 4), (uint16_t)(base - 12), 4, 3, COL_BG);
-        display_fill_rect((uint16_t)(x + 13), (uint16_t)(base - 12), 4, 3, COL_BG);
-        break;
-    case 1:
-        display_fill_rect(x, (uint16_t)(base - 10), 18, 9, col);
-        fill_circle((int16_t)x, (int16_t)(base - 11), 6, col);
-        display_fill_rect((uint16_t)(x + 16), (uint16_t)(base - 6), 12, 2, col);
-        break;
-    case 2:
-        display_fill_rect((uint16_t)(x + 4), (uint16_t)(base - 19), 9, 11, col);
-        fill_circle((int16_t)(x + 8), (int16_t)(base - 25), 7, col);
-        display_fill_rect((uint16_t)(x + 4), (uint16_t)(base - 27), 3, 3, COL_BG);
-        display_fill_rect((uint16_t)(x + 10), (uint16_t)(base - 27), 3, 3, COL_BG);
-        display_fill_rect((uint16_t)(x + 3), (uint16_t)(base - 8), 3, 8, col);
-        display_fill_rect((uint16_t)(x + 11), (uint16_t)(base - 8), 3, 8, col);
-        break;
-    case 3:
-        display_fill_rect((uint16_t)(x + 1), (uint16_t)(base - 23), 20, 15, col);
-        fill_circle((int16_t)(x + 11), (int16_t)(base - 28), g_elite ? 11 : 9, col);
-        display_fill_rect((uint16_t)(x + 6), (uint16_t)(base - 30), 3, 3, COL_BG);
-        display_fill_rect((uint16_t)(x + 14), (uint16_t)(base - 30), 3, 3, COL_BG);
-        display_fill_rect((uint16_t)(x + 2), (uint16_t)(base - 8), 6, 8, col);
-        display_fill_rect((uint16_t)(x + 14), (uint16_t)(base - 8), 6, 8, col);
-        break;
-    default:
-        fill_circle((int16_t)(x + 10), (int16_t)(base - 26), 8, col);
-        display_fill_rect((uint16_t)(x + 3), (uint16_t)(base - 24), 15, 16, col);
-        display_fill_rect((uint16_t)(x + 3), (uint16_t)(base - 8), 4, 4, col);
-        display_fill_rect((uint16_t)(x + 10), (uint16_t)(base - 8), 4, 6, col);
-        break;
-    }
-
-    if(g_phase == EP_STUN) draw_text("STUN", (uint16_t)(x - 2), SCENE_Y + 4, 1, COL_GOLD);
-}
-
-/* The enemy itself carries the tell: it whitens as a normal swing charges and
- * reddens for a breaker, so the read lives on the thing you are watching
- * rather than only on a bar at the bottom of the screen. */
-static void draw_foe(void) {
-    uint16_t c = g_foe[g_ftype].col;
-    if(g_phase == EP_WIND) c = g_is_break ? COL_BREAK : COL_WARN;
-    draw_foe_at(c);
-}
-
-static void draw_telegraph(int16_t pct, uint8_t breaker, uint8_t stalled) {
-    display_fill_rect(0, TELE_Y - 2, LCD_WIDTH, TELE_H + 4, COL_BG);
-    if(pct < 0) { g_drawn_tele = -1; return; }
-    display_fill_rect(4, TELE_Y, 120, TELE_H, COL_TRACK);
-    uint16_t w = (uint16_t)((120u * (uint16_t)pct) / 100u);
-    if(w) display_fill_rect(4, TELE_Y, w,
-                            TELE_H, stalled ? COL_FEINT : (breaker ? COL_BREAK : COL_WARN));
-    g_drawn_tele = pct;
-}
-
-static void draw_msg(const char* a, const char* b) {
-    display_fill_rect(0, MSG_Y - 2, LCD_WIDTH, 24, COL_BG);
-    if(a) draw_text_mid(a, MSG_Y, 2, COL_INK);
-    if(b) draw_text_mid(b, (uint16_t)(MSG_Y + 12), 1, COL_DIM);
-}
-
-static void show_msg(const char* a, const char* b) {
-    g_msg_t0 = ms_now();
-    draw_msg(a, b);
+/* Torches sit above every actor box, so they can flicker without ever
+ * colliding with a dirty rect. */
+static void draw_torch(int16_t x, uint8_t seed) {
+    uint8_t f = (uint8_t)(seed & 3u);
+    px_rect(x, 49, 5, 8, COL_BG);
+    px_rect((int16_t)(x + 1), 53, 3, 4, COL_RGB(90, 70, 50));
+    px_rect((int16_t)(x + 1 - (f & 1)), (int16_t)(49 + (f >> 1)), 3, 4,
+            (f & 1) ? COL_TORCH : COL_RGB(255, 210, 90));
 }
 
 static void draw_scene_bg(void) {
     display_fill(COL_BG);
-    display_fill_rect(0, SCENE_Y, LCD_WIDTH, 2, COL_STONE);
-    display_fill_rect(0, GROUND_Y, LCD_WIDTH,
-                      (uint16_t)(SCENE_Y + SCENE_H - GROUND_Y), COL_FLOOR);
+    px_rect(0, SCENE_Y, LCD_WIDTH, 2, COL_WALL);
+    /* A few wall bricks give the band depth for ~200 px of cost. */
+    for(int16_t x = 0; x < LCD_WIDTH; x = (int16_t)(x + 22))
+        px_rect(x, (int16_t)(SCENE_Y + 2), 1, 5, COL_WALL);
+    px_rect(0, GROUND_Y, LCD_WIDTH, (int16_t)(SCENE_Y + SCENE_H - GROUND_Y), COL_FLOOR);
+    px_rect(0, GROUND_Y, LCD_WIDTH, 1, COL_WALL);
+    draw_torch(6, 0);
+    draw_torch(117, 2);
 }
 
 /* ===================================================================
- * Doors — a run of choices instead of a corridor
+ * Particles
+ * =================================================================== */
+static void burst(int16_t x, int16_t y, uint8_t n, uint16_t col, int16_t spread) {
+    for(uint8_t i = 0; i < NPART && n; i++) {
+        if(g_part[i].life) continue;
+        g_part[i].x = (int16_t)(x << 6);
+        g_part[i].y = (int16_t)(y << 6);
+        g_part[i].vx = (int16_t)((int16_t)rnd((uint32_t)(spread * 2)) - spread);
+        g_part[i].vy = (int16_t)(-(int16_t)rnd(70) - 20);
+        g_part[i].ox = -1;
+        g_part[i].life = (uint8_t)(6 + rnd(6));
+        g_part[i].col = col;
+        n--;
+    }
+}
+
+static void parts_clear(void) {
+    for(uint8_t i = 0; i < NPART; i++)
+        if(g_part[i].life && g_part[i].ox >= 0)
+            scene_clear(g_part[i].ox, g_part[i].oy, 2, 2);
+}
+
+static void parts_step_draw(void) {
+    for(uint8_t i = 0; i < NPART; i++) {
+        if(!g_part[i].life) continue;
+        g_part[i].x = (int16_t)(g_part[i].x + g_part[i].vx);
+        g_part[i].y = (int16_t)(g_part[i].y + g_part[i].vy);
+        g_part[i].vy = (int16_t)(g_part[i].vy + 9);
+        if(--g_part[i].life == 0) { g_part[i].ox = -1; continue; }
+        int16_t px = (int16_t)(g_part[i].x >> 6), py = (int16_t)(g_part[i].y >> 6);
+        if(py >= GROUND_Y - 1) { g_part[i].life = 0; g_part[i].ox = -1; continue; }
+        g_part[i].ox = px; g_part[i].oy = py;
+        px_rect(px, py, 2, 2, g_part[i].col);
+    }
+}
+
+/* ===================================================================
+ * HUD
+ * =================================================================== */
+static void draw_hp_bar(void) {
+    px_rect(4, HP_Y, 84, 7, COL_TRACK);
+    uint32_t w  = ((uint32_t)g_hp * 84u) / (g_maxhp ? g_maxhp : 1u);
+    uint32_t wg = ((uint32_t)g_hp_ghost * 84u) / (g_maxhp ? g_maxhp : 1u);
+    if(wg > w) px_rect((int16_t)(4 + w), HP_Y, (int16_t)(wg - w), 7, COL_GHOST);
+    if(w) px_rect(4, HP_Y, (int16_t)w, 7, (g_hp * 4u <= g_maxhp) ? COL_HPLOW : COL_HP);
+}
+
+static uint16_t g_stam_w = 0xFFFFu;
+static void draw_stam_bar(void) {
+    int32_t s = g_stam < 0 ? 0 : g_stam;
+    uint16_t w = (uint16_t)(((uint32_t)s * 84u) / (uint32_t)g_stammax);
+    uint16_t col = (s * 4 <= g_stammax) ? COL_STAMLOW : COL_STAM;
+    if(g_stam_w > 84u) g_stam_w = 84u;
+    if(w == g_stam_w) return;
+    if(w > g_stam_w) px_rect((int16_t)(4 + g_stam_w), STAM_Y, (int16_t)(w - g_stam_w), 5, col);
+    else             px_rect((int16_t)(4 + w), STAM_Y, (int16_t)(g_stam_w - w), 5, COL_TRACK);
+    if(w) px_rect(4, STAM_Y, (int16_t)w, 5, col);
+    g_stam_w = w;
+}
+static void reset_stam_bar(void) {
+    px_rect(4, STAM_Y, 84, 5, COL_TRACK);
+    g_stam_w = 0;
+    draw_stam_bar();
+}
+
+static void draw_stats(void) {
+    char b[4];
+    uint8_t n = num_str(b, g_floor);
+    px_rect(90, HP_Y - 1, 38, 20, COL_BG);
+    draw_text("F", 91, HP_Y, 2, COL_DIM);
+    draw_span(b, n, 100, HP_Y, 2, COL_INK);
+    n = num_str(b, g_atk);
+    draw_text("A", 91, STAM_Y, 1, COL_DIM);
+    draw_span(b, n, 97, STAM_Y, 1, COL_GOLD);
+    n = num_str(b, g_armor);
+    draw_text("D", 110, STAM_Y, 1, COL_DIM);
+    draw_span(b, n, 116, STAM_Y, 1, COL_STAM);
+}
+
+static void draw_bars(void) { draw_hp_bar(); reset_stam_bar(); draw_stats(); }
+
+static void draw_ebar(void) {
+    if(g_ehp == 0u && g_ehp_ghost == 0u) { px_rect(0, EBAR_Y - 1, LCD_WIDTH, 11, COL_BG); return; }
+    px_rect(4, (int16_t)(EBAR_Y + 5), 120, 5, COL_TRACK);
+    uint32_t w  = ((uint32_t)g_ehp * 120u) / (g_emaxhp ? g_emaxhp : 1u);
+    uint32_t wg = ((uint32_t)g_ehp_ghost * 120u) / (g_emaxhp ? g_emaxhp : 1u);
+    if(wg > w) px_rect((int16_t)(4 + w), (int16_t)(EBAR_Y + 5), (int16_t)(wg - w), 5, COL_GHOST);
+    if(w) px_rect(4, (int16_t)(EBAR_Y + 5), (int16_t)w, 5, COL_EHP);
+}
+
+static void draw_ename(void) {
+    px_rect(0, EBAR_Y - 1, LCD_WIDTH, 6, COL_BG);
+    draw_text(g_foe[g_ftype].name, 4, EBAR_Y, 1, COL_DIM);
+    if(g_elite) draw_text("ELITE", 100, EBAR_Y, 1, COL_GOLD);
+}
+
+/* Damage numbers rise and shrink inside their own strip, so clearing one is
+ * a single flat fill and they never fight the sprites for pixels. */
+#define FLOAT_X (ENEMY_X - 2)
+static void draw_float(void) {
+    px_rect(FLOAT_X, FLOAT_Y, LCD_WIDTH - FLOAT_X, 11, COL_BG);
+    if(!g_float_n) return;
+    char b[4];
+    uint8_t n = num_str(b, g_float_n);
+    int16_t rise = (int16_t)(g_float_f > 8 ? 0 : (8 - g_float_f));
+    draw_span(b, n, (uint16_t)(ENEMY_X + 2), (uint16_t)(FLOAT_Y + rise), 2,
+              g_float_crit ? COL_GOLD : COL_INK);
+    if(g_float_crit) draw_text("CRIT", (uint16_t)(ENEMY_X + 26),
+                               (uint16_t)(FLOAT_Y + 2 + rise), 1, COL_GOLD);
+}
+
+static void pop_float(uint8_t dmg, uint8_t crit) {
+    g_float_n = dmg; g_float_crit = crit; g_float_f = 16;
+    draw_float();
+}
+
+static void draw_msg(const char* a, const char* b, uint16_t col) {
+    px_rect(0, MSG_Y - 2, LCD_WIDTH, 24, COL_BG);
+    if(a) draw_text_mid(a, MSG_Y, 2, col);
+    if(b) draw_text_mid(b, (uint16_t)(MSG_Y + 13), 1, COL_DIM);
+}
+static void show_msg(const char* a, const char* b, uint16_t col) {
+    g_msg_t0 = ms_now();
+    draw_msg(a, b, col);
+}
+
+/* ===================================================================
+ * Hero
+ * =================================================================== */
+static int16_t shake_off(void) {
+    if(!g_shake) return 0;
+    return (int16_t)((g_shake & 1u) ? 2 : -2);
+}
+
+static void draw_hero(void) {
+    scene_clear(HB_X, HB_Y, HB_W, HB_H);
+
+    int16_t sx = shake_off();
+    int16_t x  = (int16_t)(HERO_X + g_hx + sx);
+    int16_t base = GROUND_Y;
+    int16_t bob = (int16_t)((g_bob < 2u && !g_swing_f && !g_guard) ? -1 : 0);
+    base = (int16_t)(base + bob);
+
+    uint16_t body = g_h_flash ? COL_FLASH : (g_broken ? COL_HPLOW : COL_HERO);
+    uint16_t dark = g_h_flash ? COL_FLASH : COL_HEROD;
+
+    /* A lean sells intent before the limbs do. */
+    int16_t lean = g_swing_f ? ((g_swing_f <= 2u) ? 3 : 1) : (g_guard ? -2 : 0);
+    int16_t bx = (int16_t)(x + lean);
+
+    px_rect((int16_t)(bx + 2), (int16_t)(base - 8), 4, 8, dark);
+    px_rect((int16_t)(bx + 8), (int16_t)(base - 8), 4, 8, dark);
+    px_rect((int16_t)(bx + 1), (int16_t)(base - 21), 12, 13, body);
+    px_rect((int16_t)(bx + 3), (int16_t)(base - 30), 9, 9, body);
+    px_rect((int16_t)(bx + 9), (int16_t)(base - 27), 3, 2, COL_BG);
+
+    int16_t px_ = (int16_t)(bx + 13), py = (int16_t)(base - 22);
+
+    if(g_broken) {
+        draw_text("BROKEN", (int16_t)(HB_X + 2), (int16_t)(HB_Y + 2), 1, COL_HPLOW);
+        return;
+    }
+
+    if(g_guard) {
+        /* Stamina IS the shield's fill level — the resource sits where the
+         * player is already looking instead of in a bar they have to check. */
+        int16_t sh = 20, sw = 6;
+        int16_t syt = (int16_t)(base - 28);
+        int32_t fill = ((int32_t)(g_stam < 0 ? 0 : g_stam) * sh) / g_stammax;
+        uint16_t gc = (g_stam * 4 <= g_stammax) ? COL_STAMLOW : COL_STAM;
+        px_rect((int16_t)(px_ + 1), syt, sw, sh, COL_TRACK);
+        if(fill) px_rect((int16_t)(px_ + 1), (int16_t)(syt + sh - fill), sw,
+                         (int16_t)fill, gc);
+        px_rect((int16_t)(px_ + 1), syt, sw, 1, gc);
+        px_rect((int16_t)(px_ + 1), (int16_t)(syt + sh - 1), sw, 1, gc);
+        px_rect(px_, (int16_t)(syt + 5), 1, 10, gc);
+        return;
+    }
+
+    if(g_swing_f) {
+        /* Frame 1 is already fully extended and carries an arc smear behind
+         * it, so the swing reads as motion without costing input latency. */
+        static const uint8_t blade_a[6] = { 0, 0, 1, 2, 3, 4 };
+        uint8_t a = blade_a[g_swing_f];
+        int16_t r0 = 5, r1 = (int16_t)(g_swing_f <= 2u ? 19 : 15);
+        draw_line((int16_t)(px_ + (r0 * icos(a) >> 7)),
+                  (int16_t)(py + (r0 * isin(a) >> 7)),
+                  (int16_t)(px_ + (r1 * icos(a) >> 7)),
+                  (int16_t)(py + (r1 * isin(a) >> 7)), 2, COL_BLADE);
+        if(g_swing_f == 1u) draw_arc(px_, py, 19, 14, 2, 2, COL_BLADE);
+        if(g_swing_f == 2u) draw_arc(px_, py, 17, 15, 2, 2, COL_HEROD);
+        return;
+    }
+
+    draw_line(px_, (int16_t)(py + 2), px_, (int16_t)(py + 15), 2, COL_BLADE);
+}
+
+/* ===================================================================
+ * Enemy
+ * =================================================================== */
+static void draw_foe(void) {
+    scene_clear(FB_X, FB_Y, FB_W, FB_H);
+    if(g_ehp == 0u && !g_dying) return;
+
+    int16_t sx = shake_off();
+    int16_t x  = (int16_t)(ENEMY_X + g_ex + sx);
+    int16_t base = GROUND_Y;
+
+    uint16_t col = g_foe[g_ftype].col;
+    if(g_e_flash) col = COL_FLASH;
+    else if(g_phase == EP_WIND) col = g_is_break ? COL_BREAK : COL_WARN;
+
+    /* Death: the body sinks into the floor over ~10 frames. */
+    int16_t sink = 0;
+    if(g_dying) {
+        sink = (int16_t)((10 - (int16_t)g_death_f) * 2);
+        if(g_death_f < 5u) col = COL_HEROD;
+    }
+    base = (int16_t)(base + sink);
+
+    /* Charging pulls back and compresses; it is the tell you feel before you
+     * read the colour. */
+    int16_t sq = 0;
+    if(g_phase == EP_WIND) {
+        uint16_t el = (uint16_t)(ms_now() - g_ph_t0);
+        int16_t pct = (int16_t)((el * 100u) / (g_ph_dur ? g_ph_dur : 1u));
+        if(pct > 100) pct = 100;
+        sq = (int16_t)(pct / 34);
+    } else if(g_bob < 2u) {
+        sq = 1;
+    }
+
+    switch(g_ftype) {
+    case 0: {                                   /* SLIME — squash and stretch */
+        int16_t r = (int16_t)((g_elite ? 12 : 10) + sq);
+        fill_circle((int16_t)(x + 10), (int16_t)(base - r + 2), r, col);
+        px_rect((int16_t)(x + 4), (int16_t)(base - r - 1), 4, 3, COL_BG);
+        px_rect((int16_t)(x + 13), (int16_t)(base - r - 1), 4, 3, COL_BG);
+        break;
+    }
+    case 1:                                     /* RAT */
+        px_rect(x, (int16_t)(base - 10 + sq), 18, (int16_t)(9 - sq), col);
+        fill_circle(x, (int16_t)(base - 11), 6, col);
+        px_rect((int16_t)(x - 3), (int16_t)(base - 13), 3, 3, col);
+        draw_line((int16_t)(x + 17), (int16_t)(base - 6),
+                  (int16_t)(x + 28), (int16_t)(base - 11), 2, col);
+        break;
+    case 2:                                     /* SKELETON */
+        px_rect((int16_t)(x + 4), (int16_t)(base - 19 + sq), 9, (int16_t)(11 - sq), col);
+        for(int16_t i = 0; i < 3; i++)
+            px_rect((int16_t)(x + 4), (int16_t)(base - 17 + sq + i * 4), 9, 1, COL_BG);
+        fill_circle((int16_t)(x + 8), (int16_t)(base - 25 + sq), 7, col);
+        px_rect((int16_t)(x + 4), (int16_t)(base - 27 + sq), 3, 3, COL_BG);
+        px_rect((int16_t)(x + 10), (int16_t)(base - 27 + sq), 3, 3, COL_BG);
+        px_rect((int16_t)(x + 3), (int16_t)(base - 8), 3, 8, col);
+        px_rect((int16_t)(x + 11), (int16_t)(base - 8), 3, 8, col);
+        draw_line((int16_t)(x + 1), (int16_t)(base - 18),
+                  (int16_t)(x - 6), (int16_t)(base - 24), 2, COL_HEROD);
+        break;
+    case 3:                                     /* ORC */
+        px_rect((int16_t)(x + 1), (int16_t)(base - 23 + sq), 20, (int16_t)(15 - sq), col);
+        fill_circle((int16_t)(x + 11), (int16_t)(base - 27 + sq), g_elite ? 11 : 9, col);
+        px_rect((int16_t)(x + 6), (int16_t)(base - 29 + sq), 3, 3, COL_BREAK);
+        px_rect((int16_t)(x + 14), (int16_t)(base - 29 + sq), 3, 3, COL_BREAK);
+        px_rect((int16_t)(x + 2), (int16_t)(base - 8), 6, 8, col);
+        px_rect((int16_t)(x + 14), (int16_t)(base - 8), 6, 8, col);
+        draw_line((int16_t)(x - 1), (int16_t)(base - 20),
+                  (int16_t)(x - 8), (int16_t)(base - 28), 3, COL_HEROD);
+        break;
+    default: {                                  /* WRAITH — hovers, no legs */
+        int16_t hov = (int16_t)((g_bob < 2u) ? -2 : 0);
+        fill_circle((int16_t)(x + 10), (int16_t)(base - 26 + hov), 8, col);
+        px_rect((int16_t)(x + 6), (int16_t)(base - 28 + hov), 3, 3, COL_BG);
+        px_rect((int16_t)(x + 12), (int16_t)(base - 28 + hov), 3, 3, COL_BG);
+        for(int16_t i = 0; i < 5; i++)
+            px_rect((int16_t)(x + 3 + (i & 1)), (int16_t)(base - 22 + hov + i * 3),
+                    (int16_t)(15 - i * 2), 2, col);
+        break;
+    }
+    }
+
+    if(g_phase == EP_STUN && !g_dying) {
+        draw_text("STUN", (int16_t)(x - 2), (int16_t)(FB_Y + 1), 1, COL_GOLD);
+        draw_arc((int16_t)(x + 10), (int16_t)(FB_Y + 6), 12, 12, 4, 1, COL_GOLD);
+    }
+}
+
+/* ===================================================================
+ * Telegraph — the parry window is drawn, so timing is learnable
+ * =================================================================== */
+static void draw_tele_track(void) {
+    px_rect(0, TELE_Y - 2, LCD_WIDTH, TELE_H + 4, COL_BG);
+    px_rect(4, TELE_Y, 120, TELE_H, COL_TRACK);
+    uint16_t zw = (uint16_t)((120u * PARRY_MS) / (g_ph_dur ? g_ph_dur : 1u));
+    if(zw > 120u) zw = 120u;
+    g_zone_x = (int16_t)(4 + 120 - zw);
+    px_rect(g_zone_x, TELE_Y, (int16_t)zw, TELE_H, COL_ZONE);
+    px_rect(g_zone_x, TELE_Y, 1, TELE_H, COL_GOLD);
+    g_tele_w = 0;
+}
+
+static void draw_tele_fill(uint16_t pct) {
+    uint16_t w = (uint16_t)((120u * pct) / 100u);
+    if(w <= g_tele_w) return;
+    uint16_t col = g_feinted ? COL_FEINT : (g_is_break ? COL_BREAK : COL_WARN);
+    /* Inside the parry window the fill brightens — that is the "press now".
+     * Split the new slice at the zone edge so this is at most two rects. */
+    int16_t a = (int16_t)(4 + g_tele_w), b = (int16_t)(4 + w);
+    int16_t z = (g_is_break) ? b : g_zone_x;
+    if(z > b) z = b;
+    if(z < a) z = a;
+    if(z > a) px_rect(a, TELE_Y, (int16_t)(z - a), TELE_H, col);
+    if(b > z) px_rect(z, TELE_Y, (int16_t)(b - z), TELE_H, COL_GOLD);
+    g_tele_w = w;
+}
+
+static void clear_tele(void) {
+    px_rect(0, TELE_Y - 2, LCD_WIDTH, TELE_H + 4, COL_BG);
+    g_tele_w = 0;
+}
+
+/* ===================================================================
+ * Menus — partial repaint so a tap feels instant
  * =================================================================== */
 static const char* room_name(uint8_t k) {
     switch(k) {
@@ -452,31 +714,228 @@ static const char* room_name(uint8_t k) {
 static const char* room_hint(uint8_t k) {
     switch(k) {
     case RM_FIGHT: return "A FOE";
-    case RM_ELITE: return "HARD LOOT";
+    case RM_ELITE: return "HARD  GOOD LOOT";
     case RM_LOOT:  return "PICK ONE";
-    case RM_REST:  return "HEAL HALF";
+    case RM_REST:  return "HEAL AND REFILL";
     default:       return "GO DEEPER";
     }
 }
 
-static void draw_doors(void) {
-    display_fill(COL_BG);
-    draw_bars();
-    draw_text_mid("CHOOSE", 32, 2, COL_DIM);
-
-    for(uint8_t i = 0; i < 2u; i++) {
-        uint16_t y = (uint16_t)(54 + i * 42);
-        uint8_t on = (i == g_sel);
-        display_fill_rect(8, y, 112, 36, on ? COL_STONE : COL_TRACK);
-        if(on) {
-            display_fill_rect(8, y, 112, 2, COL_SEL);
-            display_fill_rect(8, (uint16_t)(y + 34), 112, 2, COL_SEL);
-        }
-        draw_text_mid(room_name(g_door[i]), (uint16_t)(y + 7), 2,
-                      on ? COL_INK : COL_DIM);
-        draw_text_mid(room_hint(g_door[i]), (uint16_t)(y + 23), 1, COL_DIM);
+static void draw_panel(uint8_t i, const char* a, const char* b, uint16_t acol) {
+    int16_t y = (int16_t)(54 + i * 42);
+    uint8_t on = (i == g_sel);
+    px_rect(8, y, 112, 36, on ? COL_WALL : COL_TRACK);
+    if(on) {
+        px_rect(8, y, 112, 2, COL_SEL_BAR);
+        px_rect(8, (int16_t)(y + 34), 112, 2, COL_SEL_BAR);
+        px_rect(8, y, 2, 36, COL_SEL_BAR);
+        px_rect(118, y, 2, 36, COL_SEL_BAR);
     }
-    draw_text_mid("TAP SWITCH  HOLD GO", 146, 1, COL_DIM);
+    draw_text_mid(a, (uint16_t)(y + 8), 2, on ? acol : COL_DIM);
+    draw_text_mid(b, (uint16_t)(y + 24), 1, on ? COL_INK : COL_DIM);
+}
+
+static void draw_doors(uint8_t full) {
+    if(full) {
+        display_fill(COL_BG);
+        draw_bars();
+        draw_text_mid("CHOOSE A DOOR", 32, 1, COL_DIM);
+        draw_text_mid("TAP SWITCH   HOLD GO", 146, 1, COL_DIM);
+    }
+    for(uint8_t i = 0; i < 2u; i++)
+        draw_panel(i, room_name(g_door[i]), room_hint(g_door[i]),
+                   (g_door[i] == RM_STAIR) ? COL_GOLD : COL_INK);
+}
+
+static void draw_pick(uint8_t full) {
+    if(full) {
+        display_fill(COL_BG);
+        draw_bars();
+        draw_text_mid("TAKE ONE", 32, 1, COL_DIM);
+        draw_text_mid("TAP SWITCH   HOLD TAKE", 146, 1, COL_DIM);
+    }
+    for(uint8_t i = 0; i < 2u; i++)
+        draw_panel(i, g_item_name[g_pick[i]], g_item_desc[g_pick[i]], COL_GOLD);
+}
+
+/* ===================================================================
+ * Combat
+ * =================================================================== */
+#define FRAME_MS 33u
+
+static void spawn_foe(uint8_t elite) {
+    uint8_t pool = (g_floor <= 1u) ? 2u : (g_floor <= 3u) ? 3u
+                 : (g_floor <= 6u) ? 4u : 5u;
+    g_ftype = (uint8_t)rnd(pool);
+    g_elite = elite;
+
+    const Foe* f = &g_foe[g_ftype];
+    g_emaxhp = (uint16_t)(f->hp_base + f->hp_per * g_floor);
+    g_eatk   = (uint8_t)(f->atk_base + (f->atk_per4 * g_floor) / 4u);
+    if(elite) { g_emaxhp = (uint16_t)(g_emaxhp * 2u); g_eatk = (uint8_t)(g_eatk + 2u); }
+    g_ehp = g_emaxhp; g_ehp_ghost = g_emaxhp;
+
+    uint16_t cut = (uint16_t)(g_floor * 32u);
+    g_ewind  = (f->wind_ms > cut && (uint16_t)(f->wind_ms - cut) > f->wind_min)
+                   ? (uint16_t)(f->wind_ms - cut) : f->wind_min;
+    g_erecov = f->recover_ms;
+    g_egap   = f->gap_ms;
+    g_ebreak = f->break_pct;
+    g_efeint = f->feint_pct;
+    g_ecombo = f->combo_max;
+
+    g_phase = EP_IDLE;
+    g_ph_t0 = ms_now();
+    g_ph_dur = (uint16_t)(500u + rnd(400));
+    g_combo_left = 0; g_followup = 0; g_feint_at = 0; g_feinted = 0;
+    g_guard = 0; g_broken = 0; g_dying = 0; g_death_f = 0;
+    g_swing_f = 0; g_hitstop = 0; g_shake = 0;
+    g_h_flash = 0; g_e_flash = 0; g_hx = 0; g_ex = 0;
+    g_float_n = 0;
+    for(uint8_t i = 0; i < NPART; i++) g_part[i].life = 0;
+
+    draw_scene_bg();
+    draw_bars();
+    draw_ename();
+    draw_ebar();
+    draw_float();
+    draw_hero();
+    draw_foe();
+    clear_tele();
+    draw_msg(g_foe[g_ftype].name, elite ? "ELITE" : 0,
+             elite ? COL_GOLD : COL_INK);
+    g_state = ST_FIGHT;
+}
+
+static void hero_hurt(uint16_t dmg, uint8_t big) {
+    if(dmg < 1u) dmg = 1u;
+    g_hp = (g_hp > dmg) ? (uint16_t)(g_hp - dmg) : 0u;
+    g_h_flash = 3;
+    g_hx = (int16_t)(-3 - (big ? 3 : 0));
+    g_shake = (uint8_t)(big ? 7 : 4);
+    g_hitstop = (uint8_t)(big ? HITSTOP_BIG : HITSTOP_HIT);
+    burst((int16_t)(HERO_X + 8), (int16_t)(GROUND_Y - 18),
+          (uint8_t)(big ? 7 : 4), COL_HPLOW, 90);
+}
+
+static void guard_break(void) {
+    g_broken = 1; g_guard = 0;
+    g_broke_t0 = ms_now();
+    g_stam = (int16_t)(g_stammax / 3);
+    g_shake = 7; g_hitstop = HITSTOP_BIG;
+    burst((int16_t)(HERO_X + 14), (int16_t)(GROUND_Y - 20), 8, COL_STAMLOW, 110);
+    show_msg("GUARD BROKEN", "STAMINA RAN OUT", COL_STAMLOW);
+}
+
+static void enemy_strike(void) {
+    uint16_t dmg = g_eatk;
+    if(g_armor) dmg = (dmg > g_armor) ? (uint16_t)(dmg - g_armor) : 1u;
+
+    g_ex = -9;                              /* the lunge lands the hit */
+
+    if(g_broken) {
+        hero_hurt((uint16_t)(dmg + dmg / 2u), 1);
+        show_msg("PUNISHED", 0, COL_HPLOW);
+    } else if(g_is_break) {
+        if(g_guard) {
+            hero_hurt((uint16_t)(dmg + dmg / 2u + 1u), 1);
+            g_stam = (int16_t)(g_stam - STAM_BLOCK * 2);
+            show_msg("SHATTERED", "RED MEANS RELEASE", COL_BREAK);
+        } else {
+            hero_hurt((uint16_t)(dmg / 2u), 0);
+            show_msg("GRAZED", 0, COL_DIM);
+        }
+    } else if(g_guard) {
+        uint16_t since = (uint16_t)(ms_now() - g_guard_t0);
+        if(since <= PARRY_MS) {
+            g_stam = (int16_t)(g_stam + STAM_PARRY);
+            if(g_stam > g_stammax) g_stam = g_stammax;
+            g_phase = EP_STUN; g_ph_t0 = ms_now(); g_ph_dur = 1200u;
+            g_combo_left = 0; g_followup = 0;
+            g_e_flash = 3; g_shake = 6; g_hitstop = HITSTOP_BIG;
+            g_ex = 8;
+            burst((int16_t)(HERO_X + 18), (int16_t)(GROUND_Y - 20), 9, COL_GOLD, 130);
+            draw_stam_bar();
+            show_msg("PARRY", "STAMINA BACK", COL_GOLD);
+            return;
+        }
+        g_hp = (g_hp > 1u) ? (uint16_t)(g_hp - 1u) : 0u;
+        g_stam = (int16_t)(g_stam - STAM_BLOCK);
+        g_shake = 3; g_hitstop = HITSTOP_HIT;
+        burst((int16_t)(HERO_X + 16), (int16_t)(GROUND_Y - 20), 4, COL_STAM, 90);
+        show_msg("BLOCK", 0, COL_STAM);
+    } else {
+        hero_hurt(dmg, 0);
+        show_msg("HIT", 0, COL_HPLOW);
+    }
+
+    if(g_stam <= 0 && !g_broken) { guard_break(); return; }
+
+    if(g_combo_left > 0u) {
+        g_combo_left--;
+        g_followup = 1;
+        g_phase = EP_IDLE; g_ph_t0 = ms_now(); g_ph_dur = g_egap;
+    } else {
+        g_followup = 0;
+        g_phase = EP_REC; g_ph_t0 = ms_now(); g_ph_dur = g_erecov;
+    }
+}
+
+static void hero_swing(void) {
+    uint16_t dmg = g_atk;
+    uint8_t open = (g_phase == EP_REC || g_phase == EP_STUN);
+    if(open) dmg = (uint16_t)(dmg * 2u);
+    g_ehp = (g_ehp > dmg) ? (uint16_t)(g_ehp - dmg) : 0u;
+
+    g_e_flash = 2;
+    g_ex = (int16_t)(g_ex + (open ? 7 : 4));    /* knockback */
+    g_shake = (uint8_t)(open ? 5 : 2);
+    g_hitstop = (uint8_t)(open ? HITSTOP_BIG : HITSTOP_HIT);
+    burst((int16_t)(ENEMY_X + 2), (int16_t)(GROUND_Y - 16),
+          (uint8_t)(open ? 8 : 5), open ? COL_GOLD : COL_SPARK, 110);
+    pop_float((uint8_t)dmg, open);
+}
+
+/* ===================================================================
+ * Screens
+ * =================================================================== */
+static void draw_title(void) {
+    display_fill(COL_BG);
+    draw_text_mid("DEEP", 12, 5, COL_INK);
+    draw_text_mid("DARK", 44, 5, COL_GOLD);
+    px_rect(24, 76, 80, 1, COL_WALL);
+    draw_text_mid("TAP ATTACK", 84, 2, COL_INK);
+    draw_text_mid("HOLD GUARD", 100, 2, COL_STAM);
+    draw_text_mid("GUARD BURNS STAMINA", 120, 1, COL_STAMLOW);
+    draw_text_mid("RED CANNOT BE BLOCKED", 131, 1, COL_BREAK);
+    if(g_best) {
+        char b[4];
+        uint8_t n = num_str(b, g_best);
+        draw_text("BEST F", 38, 150, 1, COL_DIM);
+        draw_span(b, n, 76, 148, 2, COL_GOLD);
+    }
+}
+
+static void draw_dead(void) {
+    display_fill(COL_BG);
+    draw_text_mid("YOU DIED", 30, 3, COL_HPLOW);
+    char b[4];
+    uint8_t n = num_str(b, g_floor);
+    draw_text_mid("FLOOR", 70, 2, COL_DIM);
+    draw_span_mid(b, n, 86, 6, COL_INK);
+    if(g_floor >= g_best) draw_text_mid("DEEPEST YET", 132, 1, COL_GOLD);
+    draw_text_mid("TAP", 148, 1, COL_DIM);
+}
+
+static void offer_doors(void);
+
+static void run_begin(void) {
+    g_seed ^= ((uint32_t)ms_now() << 11) ^ 0xDEADBEEFUL;
+    g_maxhp = 24; g_hp = g_maxhp; g_hp_ghost = g_maxhp;
+    g_stammax = STAM_MAX; g_stam = g_stammax;
+    g_atk = 3; g_armor = 0; g_floor = 1;
+    g_rooms = (uint8_t)(3u + rnd(2)); g_room = 0;
+    offer_doors();
 }
 
 static uint8_t roll_room(void) {
@@ -496,38 +955,16 @@ static void offer_doors(void) {
         do { g_door[1] = roll_room(); } while(g_door[1] == g_door[0]);
     }
     g_sel = 0;
-    draw_doors();
+    g_ehp = 0; g_ehp_ghost = 0;
+    draw_doors(1);
     g_state = ST_DOORS;
-}
-
-/* ===================================================================
- * Loot — two options, because picking is where a build comes from
- * =================================================================== */
-static void draw_pick(void) {
-    display_fill(COL_BG);
-    draw_bars();
-    draw_text_mid("TAKE ONE", 32, 2, COL_DIM);
-
-    for(uint8_t i = 0; i < 2u; i++) {
-        uint16_t y = (uint16_t)(54 + i * 42);
-        uint8_t on = (i == g_sel);
-        display_fill_rect(8, y, 112, 36, on ? COL_STONE : COL_TRACK);
-        if(on) {
-            display_fill_rect(8, y, 112, 2, COL_SEL);
-            display_fill_rect(8, (uint16_t)(y + 34), 112, 2, COL_SEL);
-        }
-        draw_text_mid(g_item_name[g_pick[i]], (uint16_t)(y + 7), 1,
-                      on ? COL_GOLD : COL_DIM);
-        draw_text_mid(g_item_desc[g_pick[i]], (uint16_t)(y + 20), 1, COL_DIM);
-    }
-    draw_text_mid("TAP SWITCH  HOLD TAKE", 146, 1, COL_DIM);
 }
 
 static void offer_loot(void) {
     g_pick[0] = (uint8_t)rnd(IT_COUNT);
     do { g_pick[1] = (uint8_t)rnd(IT_COUNT); } while(g_pick[1] == g_pick[0]);
     g_sel = 0;
-    draw_pick();
+    draw_pick(1);
     g_state = ST_PICK;
 }
 
@@ -540,168 +977,7 @@ static void take_item(uint8_t it) {
     default:       g_stammax = (int16_t)(g_stammax + 25); g_stam = g_stammax; break;
     }
     if(g_hp > g_maxhp) g_hp = g_maxhp;
-}
-
-/* ===================================================================
- * Combat
- * =================================================================== */
-static void spawn_foe(uint8_t elite) {
-    uint8_t pool = (g_floor <= 1u) ? 2u : (g_floor <= 3u) ? 3u
-                 : (g_floor <= 6u) ? 4u : 5u;
-    g_ftype = (uint8_t)rnd(pool);
-    g_elite = elite;
-
-    const Foe* f = &g_foe[g_ftype];
-    g_emaxhp = (uint16_t)(f->hp_base + f->hp_per * g_floor);
-    g_eatk   = (uint8_t)(f->atk_base + (f->atk_per4 * g_floor) / 4u);
-    if(elite) { g_emaxhp = (uint16_t)(g_emaxhp * 2u); g_eatk = (uint8_t)(g_eatk + 2u); }
-    g_ehp = g_emaxhp;
-
-    uint16_t cut = (uint16_t)(g_floor * 32u);
-    g_ewind  = (f->wind_ms > cut && (uint16_t)(f->wind_ms - cut) > f->wind_min)
-                   ? (uint16_t)(f->wind_ms - cut) : f->wind_min;
-    g_erecov = f->recover_ms;
-    g_egap   = f->gap_ms;
-    g_ebreak = f->break_pct;
-    g_efeint = f->feint_pct;
-    g_ecombo = f->combo_max;
-
-    g_phase = EP_IDLE;
-    g_ph_t0 = ms_now();
-    g_ph_dur = (uint16_t)(400u + rnd(460));
-    g_combo_left = 0; g_followup = 0; g_feint_at = 0; g_feinted = 0;
-    g_guard = 0; g_swinging = 0; g_broken = 0;
-    g_float_n = 0;
-
-    draw_scene_bg();
-    draw_bars();
-    draw_ebar();
-    draw_float();
-    draw_hero();
-    draw_foe();
-    draw_telegraph(-1, 0, 0);
-    draw_msg(g_foe[g_ftype].name, elite ? "ELITE" : 0);
-    g_state = ST_FIGHT;
-}
-
-static void hero_hurt(uint16_t dmg) {
-    if(dmg < 1u) dmg = 1u;
-    g_hp = (g_hp > dmg) ? (uint16_t)(g_hp - dmg) : 0u;
-    draw_bars();
-}
-
-static void guard_break(void) {
-    g_broken = 1;
-    g_guard  = 0;
-    g_broke_t0 = ms_now();
-    g_stam = g_stammax / 3;
-    draw_hero();
-    draw_bars();
-    show_msg("GUARD BROKEN", "STAMINA RAN OUT");
-}
-
-static void enemy_strike(void) {
-    uint16_t dmg = g_eatk;
-    if(g_armor) dmg = (dmg > g_armor) ? (uint16_t)(dmg - g_armor) : 1u;
-
-    if(g_broken) {
-        hero_hurt((uint16_t)(dmg + dmg / 2u));
-        show_msg("PUNISHED", 0);
-    } else if(g_is_break) {
-        if(g_guard) {
-            hero_hurt((uint16_t)(dmg + dmg / 2u + 1u));
-            g_stam -= STAM_BLOCK * 2;
-            show_msg("BROKEN", "RED MEANS RELEASE");
-        } else {
-            hero_hurt((uint16_t)(dmg / 2u));
-            show_msg("GRAZED", 0);
-        }
-    } else if(g_guard) {
-        uint16_t since = (uint16_t)(ms_now() - g_guard_t0);
-        if(since <= PARRY_MS) {
-            /* Parry refunds stamina, so reading well is what funds the next
-             * read — the skill loop pays for itself. */
-            g_stam += STAM_PARRY;
-            if(g_stam > g_stammax) g_stam = g_stammax;
-            g_phase = EP_STUN; g_ph_t0 = ms_now(); g_ph_dur = 1200u;
-            g_combo_left = 0; g_followup = 0;
-            draw_bars();
-            show_msg("PARRY", "STAMINA BACK");
-            return;
-        }
-        hero_hurt(1u);
-        g_stam -= STAM_BLOCK;
-        show_msg("BLOCK", 0);
-    } else {
-        hero_hurt(dmg);
-        show_msg("HIT", 0);
-    }
-
-    if(g_stam <= 0 && !g_broken) { guard_break(); return; }
-    draw_bars();
-
-    /* A combo keeps coming: short gap, then the next swing.  Recovery has to
-     * be earned by surviving the whole sequence. */
-    if(g_combo_left > 0u) {
-        g_combo_left--;
-        g_followup = 1;
-        g_phase = EP_IDLE;
-        g_ph_t0 = ms_now();
-        g_ph_dur = g_egap;
-    } else {
-        g_followup = 0;
-        g_phase = EP_REC;
-        g_ph_t0 = ms_now();
-        g_ph_dur = g_erecov;
-    }
-}
-
-static void hero_swing(void) {
-    uint16_t dmg = g_atk;
-    uint8_t open = (g_phase == EP_REC || g_phase == EP_STUN);
-    if(open) dmg = (uint16_t)(dmg * 2u);
-    g_ehp = (g_ehp > dmg) ? (uint16_t)(g_ehp - dmg) : 0u;
-    draw_ebar();
-    pop_float((uint8_t)dmg, open);
-}
-
-/* ===================================================================
- * Screens
- * =================================================================== */
-static void draw_title(void) {
-    display_fill(COL_BG);
-    draw_text_mid("DEEP", 14, 5, COL_INK);
-    draw_text_mid("DARK", 46, 5, COL_GOLD);
-    draw_text_mid("TAP ATTACK", 84, 2, COL_INK);
-    draw_text_mid("HOLD GUARD", 100, 2, COL_STAM);
-    draw_text_mid("GUARD BURNS STAMINA", 120, 1, COL_STAMLOW);
-    draw_text_mid("RED CANNOT BE BLOCKED", 132, 1, COL_BREAK);
-    if(g_best) {
-        char b[4];
-        uint8_t n = num_str(b, g_best);
-        draw_text("BEST F", 38, 150, 1, COL_DIM);
-        draw_span(b, n, 76, 148, 2, COL_GOLD);
-    }
-}
-
-static void draw_dead(void) {
-    display_fill(COL_BG);
-    draw_text_mid("YOU DIED", 34, 3, COL_HPLOW);
-    char b[4];
-    uint8_t n = num_str(b, g_floor);
-    draw_text_mid("FLOOR", 72, 2, COL_DIM);
-    draw_span_mid(b, n, 88, 6, COL_INK);
-    if(g_floor >= g_best) draw_text_mid("DEEPEST YET", 132, 1, COL_GOLD);
-    draw_text_mid("TAP", 148, 1, COL_DIM);
-}
-
-static void run_begin(void) {
-    g_seed ^= ((uint32_t)ms_now() << 11) ^ 0xDEADBEEFUL;
-    g_maxhp = 24; g_hp = g_maxhp;
-    g_stammax = STAM_MAX; g_stam = g_stammax;
-    g_atk = 3; g_armor = 0; g_floor = 1;
-    g_rooms = (uint8_t)(3u + rnd(2)); g_room = 0;
-    offer_doors();
+    if(g_hp_ghost < g_hp) g_hp_ghost = g_hp;
 }
 
 static void enter_room(uint8_t kind) {
@@ -711,7 +987,12 @@ static void enter_room(uint8_t kind) {
         if(g_floor > g_best) { g_best = g_floor; nv_write(NV_KEY_BEST, g_best); }
         g_rooms = (uint8_t)(3u + rnd(2));
         g_room  = 0;
-        offer_doors();
+        display_fill(COL_BG);
+        draw_bars();
+        draw_text_mid("FLOOR", 66, 2, COL_DIM);
+        { char b[4]; uint8_t n = num_str(b, g_floor); draw_span_mid(b, n, 82, 6, COL_GOLD); }
+        g_msg_t0 = ms_now();
+        g_state = ST_MSG;
         break;
     case RM_LOOT:
         offer_loot();
@@ -719,11 +1000,15 @@ static void enter_room(uint8_t kind) {
     case RM_REST:
         g_hp = (uint16_t)(g_hp + g_maxhp / 2u);
         if(g_hp > g_maxhp) g_hp = g_maxhp;
+        if(g_hp_ghost < g_hp) g_hp_ghost = g_hp;
         g_stam = g_stammax;
         display_fill(COL_BG);
         draw_bars();
-        fill_circle(64, 86, 20, COL_STAM);
-        show_msg("REST", "HEALED");
+        fill_circle(64, 84, 16, COL_TORCH);
+        fill_circle(64, 84, 9, COL_RGB(255, 230, 140));
+        draw_text_mid("REST", 108, 2, COL_INK);
+        draw_text_mid("HEALED AND REFILLED", 126, 1, COL_DIM);
+        g_msg_t0 = ms_now();
         g_state = ST_MSG;
         break;
     case RM_ELITE: spawn_foe(1); break;
@@ -731,10 +1016,7 @@ static void enter_room(uint8_t kind) {
     }
 }
 
-static void room_done(void) {
-    g_room++;
-    offer_doors();
-}
+static void room_done(void) { g_room++; offer_doors(); }
 
 /* ===================================================================
  * Framework
@@ -748,14 +1030,37 @@ void app_init(void) {
     g_best = (uint8_t)nv_read(NV_KEY_BEST, 0);
     if(g_best > 99u) g_best = 0;
     g_bat_raw = bat_read_raw();
+    g_stammax = STAM_MAX;
     g_state = ST_TITLE;
     display_fill(COL_BLACK);
     draw_title();
 }
 
-void app_update(uint32_t frame) {
-    (void)frame;
+/* One signature per actor: redraw only when the pose it encodes changes.
+ * Without this both boxes repaint every frame and the fight drops frames. */
+static uint16_t hero_sig(void) {
+    return (uint16_t)((uint16_t)(g_hx + 16) | ((uint16_t)g_swing_f << 6)
+         | ((uint16_t)g_guard << 9) | ((uint16_t)g_broken << 10)
+         | ((uint16_t)(g_h_flash ? 1u : 0u) << 11)
+         | ((uint16_t)(g_bob < 2u) << 12)
+         | ((uint16_t)(g_shake & 1u) << 13)
+         | ((uint16_t)((g_stam * 4) / (g_stammax + 1)) << 14));
+}
+static uint16_t foe_sig(void) {
+    uint16_t sq = 0;
+    if(g_phase == EP_WIND) {
+        uint16_t el = (uint16_t)(ms_now() - g_ph_t0);
+        uint16_t p = (uint16_t)((el * 100u) / (g_ph_dur ? g_ph_dur : 1u));
+        sq = (uint16_t)((p > 100u ? 100u : p) / 34u);
+    }
+    return (uint16_t)((uint16_t)(g_ex + 16) | ((uint16_t)g_phase << 6)
+         | ((uint16_t)(g_e_flash ? 1u : 0u) << 8)
+         | ((uint16_t)(g_bob < 2u) << 9)
+         | ((uint16_t)(g_shake & 1u) << 10)
+         | (sq << 11) | ((uint16_t)(g_death_f & 3u) << 13));
+}
 
+void app_update(uint32_t frame) {
     uint8_t btn = button_raw(), tap = 0, hold = 0;
     if(btn && !g_pressing) {
         g_pressing = 1; g_press_used = 0; g_press_t0 = ms_now();
@@ -776,21 +1081,20 @@ void app_update(uint32_t frame) {
         break;
 
     case ST_DOORS:
-        if(hold) { uint8_t k = g_door[g_sel]; enter_room(k); }
-        else if(tap) { g_sel ^= 1u; draw_doors(); }
+        if(hold) enter_room(g_door[g_sel]);
+        else if(tap) { g_sel ^= 1u; draw_doors(0); }
         break;
 
     case ST_PICK:
         if(hold) {
             take_item(g_pick[g_sel]);
-            draw_bars();
             display_fill(COL_BG);
             draw_bars();
             draw_text_mid(g_item_name[g_pick[g_sel]], 70, 2, COL_GOLD);
-            draw_text_mid(g_item_desc[g_pick[g_sel]], 92, 1, COL_DIM);
+            draw_text_mid(g_item_desc[g_pick[g_sel]], 92, 1, COL_INK);
             g_msg_t0 = ms_now();
             g_state = ST_MSG;
-        } else if(tap) { g_sel ^= 1u; draw_pick(); }
+        } else if(tap) { g_sel ^= 1u; draw_pick(0); }
         break;
 
     case ST_MSG:
@@ -802,26 +1106,64 @@ void app_update(uint32_t frame) {
         break;
 
     case ST_FIGHT: {
-        /* ── guard, and what it costs ─────────────────────────── */
-        if(g_broken) {
-            if((uint16_t)(ms_now() - g_broke_t0) >= BREAK_MS) {
-                g_broken = 0;
-                draw_hero();
+        /* ── hitstop: the world stops, the flash does not ──────────
+         * Every timer is pushed forward by one frame so a freeze never
+         * secretly advances the enemy's wind-up. */
+        if(g_hitstop) {
+            g_hitstop--;
+            g_ph_t0    = (uint16_t)(g_ph_t0 + FRAME_MS);
+            g_swing_t0 = (uint16_t)(g_swing_t0 + FRAME_MS);
+            g_guard_t0 = (uint16_t)(g_guard_t0 + FRAME_MS);
+            g_broke_t0 = (uint16_t)(g_broke_t0 + FRAME_MS);
+            g_msg_t0   = (uint16_t)(g_msg_t0 + FRAME_MS);
+            if(g_h_flash || g_e_flash) { draw_hero(); draw_foe(); }
+            if(g_h_flash) g_h_flash--;
+            if(g_e_flash) g_e_flash--;
+            break;
+        }
+
+        if((frame & 7u) == 0u) g_bob = (uint8_t)((g_bob + 1u) & 3u);
+        if(g_shake) g_shake--;
+        if(g_h_flash) g_h_flash--;
+        if(g_e_flash) g_e_flash--;
+        /* Offsets ease home by halving — cheap, and reads as weight. */
+        if(g_hx) g_hx = (int16_t)(g_hx - (g_hx > 0 ? (g_hx + 1) / 2 : (g_hx - 1) / 2));
+        if(g_ex) g_ex = (int16_t)(g_ex - (g_ex > 0 ? (g_ex + 1) / 2 : (g_ex - 1) / 2));
+
+        /* ── death ────────────────────────────────────────────── */
+        if(g_dying) {
+            parts_clear();
+            if(g_death_f) {
+                g_death_f--;
+                draw_foe();
+                parts_step_draw();
+                if(g_ehp_ghost) { g_ehp_ghost = (uint16_t)(g_ehp_ghost > 1u ? g_ehp_ghost - 2u : 0u); draw_ebar(); }
+                break;
             }
+            g_dying = 0;
+            draw_foe();
+            px_rect(0, EBAR_Y - 1, LCD_WIDTH, 11, COL_BG);
+            show_msg("SLAIN", 0, COL_GOLD);
+            g_state = ST_MSG;
+            break;
+        }
+
+        /* ── guard and its cost ───────────────────────────────── */
+        if(g_broken) {
+            if((uint16_t)(ms_now() - g_broke_t0) >= BREAK_MS) g_broken = 0;
         } else {
             if(want_guard != g_guard) {
                 g_guard = want_guard;
                 if(g_guard) g_guard_t0 = ms_now();
-                draw_hero();
             }
             if(g_guard) {
                 g_stam -= STAM_DRAIN;
                 if(g_stam <= 0) { g_stam = 0; guard_break(); }
-                else draw_bars();
+                draw_stam_bar();
             } else if(g_stam < g_stammax) {
                 g_stam += STAM_REGEN;
                 if(g_stam > g_stammax) g_stam = g_stammax;
-                draw_bars();
+                draw_stam_bar();
             }
         }
 
@@ -829,25 +1171,38 @@ void app_update(uint32_t frame) {
         if(tap && !g_guard && !g_broken &&
            (uint16_t)(ms_now() - g_swing_t0) >= SWING_CD) {
             g_swing_t0 = ms_now();
-            g_swinging = 1;
-            draw_hero();
+            g_swing_f = 1;
             hero_swing();
             if(g_ehp == 0u) {
-                g_swinging = 0;
-                draw_foe();
-                draw_telegraph(-1, 0, 0);
-                show_msg("SLAIN", 0);
-                g_state = ST_MSG;
-                break;
+                g_dying = 1; g_death_f = 10;
+                g_shake = 8;
+                burst((int16_t)(ENEMY_X + 8), (int16_t)(GROUND_Y - 16), 10,
+                      g_foe[g_ftype].col, 130);
+                clear_tele();
             }
+        } else if(g_swing_f) {
+            g_swing_f++;
+            if(g_swing_f > 5u) g_swing_f = 0;
         }
-        if(g_swinging && (uint16_t)(ms_now() - g_swing_t0) >= 130u) {
-            g_swinging = 0;
-            draw_hero();
+
+        if(g_float_n) {
+            g_float_f--;
+            if(g_float_f == 0u) { g_float_n = 0; draw_float(); }
+            else if(g_float_f > 8u) draw_float();
         }
-        if(g_float_n && (uint16_t)(ms_now() - g_float_t0) >= 620u) {
-            g_float_n = 0;
-            draw_float();
+
+        /* Health bars drain behind a trailing ghost, so a big hit stays big
+         * on screen for a beat after the number is gone. */
+        if(g_ehp_ghost > g_ehp) {
+            g_ehp_ghost = (uint16_t)(g_ehp_ghost - 1u);
+            draw_ebar();
+        }
+        if(g_hp_ghost > g_hp) {
+            g_hp_ghost = (uint16_t)(g_hp_ghost - 1u);
+            draw_hp_bar();
+        } else if(g_hp_ghost < g_hp) {
+            g_hp_ghost = g_hp;
+            draw_hp_bar();
         }
 
         /* ── enemy rhythm ─────────────────────────────────────── */
@@ -861,38 +1216,38 @@ void app_update(uint32_t frame) {
                     g_combo_left = (uint8_t)(n - 1u);
                 }
                 g_is_break = (rnd(100) < g_ebreak) ? 1u : 0u;
-                /* Roll the feint once, up front, so its odds are the number in
-                 * the bestiary rather than a per-frame coin flip. */
                 g_feint_at = (rnd(100) < g_efeint) ? 1u : 0u;
                 g_feinted  = 0;
                 g_phase = EP_WIND;
                 g_ph_t0 = ms_now();
-                /* Follow-ups land faster than the opener. */
                 g_ph_dur = g_followup ? (uint16_t)(g_ewind * 3u / 4u) : g_ewind;
-                draw_foe();
+                draw_tele_track();
                 draw_msg(g_is_break ? "RED" : "WHITE",
-                         g_is_break ? "DO NOT GUARD" : "GUARD IT");
+                         g_is_break ? "DO NOT GUARD" : "GUARD LATE TO PARRY",
+                         g_is_break ? COL_BREAK : COL_WARN);
             }
             break;
 
         case EP_WIND: {
-            int16_t pct = (int16_t)((el * 100u) / (g_ph_dur ? g_ph_dur : 1u));
-            if(pct > 100) pct = 100;
+            uint16_t pct = (uint16_t)((el * 100u) / (g_ph_dur ? g_ph_dur : 1u));
+            if(pct > 100u) pct = 100u;
 
-            /* Feint: the wind-up stalls near the end.  Guarding on sight now
-             * costs the stamina you needed for the real hit. */
-            if(g_feint_at && !g_feinted && pct >= 72) {
+            /* The feint stalls the wind-up and visibly slides the parry zone
+             * further out — which is exactly what makes it readable. */
+            if(g_feint_at && !g_feinted && pct >= 70u) {
                 g_feinted = 1;
                 g_ph_dur = (uint16_t)(g_ph_dur + g_ph_dur / 2u);
-                draw_msg("FEINT", "IT HELD BACK");
+                draw_tele_track();
+                draw_tele_fill((uint16_t)((el * 100u) / g_ph_dur));
+                draw_msg("FEINT", "IT HELD BACK", COL_FEINT);
+            } else {
+                draw_tele_fill(pct);
             }
-            if(pct != g_drawn_tele) draw_telegraph(pct, g_is_break, g_feinted);
 
             if(el >= g_ph_dur) {
                 enemy_strike();
-                draw_telegraph(-1, 0, 0);
-                draw_foe();
-                if(g_hp == 0u) { g_state = ST_DEAD; draw_dead(); }
+                clear_tele();
+                if(g_hp == 0u) { g_state = ST_DEAD; draw_dead(); break; }
             }
             break;
         }
@@ -902,12 +1257,24 @@ void app_update(uint32_t frame) {
             if(el >= g_ph_dur) {
                 g_phase = EP_IDLE;
                 g_ph_t0 = ms_now();
-                g_ph_dur = (uint16_t)(400u + rnd(460));
-                draw_foe();
-                draw_msg(0, 0);
+                g_ph_dur = (uint16_t)(400u + rnd(400));
+                draw_msg(0, 0, COL_INK);
             }
             break;
         }
+
+        if(g_state != ST_FIGHT) break;
+
+        /* ── render ───────────────────────────────────────────── */
+        parts_clear();
+        {
+            static uint16_t last_h = 0xFFFFu, last_f = 0xFFFFu;
+            uint16_t hs = hero_sig(), fs = foe_sig();
+            if(hs != last_h) { draw_hero(); last_h = hs; }
+            if(fs != last_f) { draw_foe();  last_f = fs; }
+        }
+        parts_step_draw();
+        if((frame & 7u) == 0u) { draw_torch(6, (uint8_t)rnd(4)); draw_torch(117, (uint8_t)rnd(4)); }
         break;
     }
     }
